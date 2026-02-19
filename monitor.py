@@ -82,19 +82,20 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
 
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
+        full = requests.compat.urljoin(base_url, href)
 
-        # catch pdfs anywhere in URL (some are like ...pdf?download=1)
-full = requests.compat.urljoin(base_url, href)
-if ".pdf" in full.lower() or "agendaviewer.php" in full.lower():
-    links.append(full)
+        # Catch direct PDFs and Granicus AgendaViewer links (sometimes no .pdf in URL)
+        if ".pdf" in full.lower() or "agendaviewer.php" in full.lower():
+            links.append(full)
 
-    # de-dupe but keep order
+    # De-dupe but keep order
     out = []
     seen = set()
     for l in links:
         if l not in seen:
             out.append(l)
             seen.add(l)
+
     return out
 
 
