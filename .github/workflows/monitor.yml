@@ -2,8 +2,8 @@ name: Planning Board Monitor
 
 on:
   schedule:
-    - cron: "0 * * * *"  # every hour
-  workflow_dispatch: {}
+    - cron: "0 14 * * 1"   # Every Monday at 9am EST (14:00 UTC)
+  workflow_dispatch:
 
 permissions:
   contents: read
