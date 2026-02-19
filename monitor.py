@@ -84,10 +84,9 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
         href = a["href"].strip()
 
         # catch pdfs anywhere in URL (some are like ...pdf?download=1)
-        if "pdf" in href.lower():
-            full = requests.compat.urljoin(base_url, href)
-            if ".pdf" in full.lower():
-                links.append(full)
+full = requests.compat.urljoin(base_url, href)
+if ".pdf" in full.lower() or "agendaviewer.php" in full.lower():
+    links.append(full)
 
     # de-dupe but keep order
     out = []
