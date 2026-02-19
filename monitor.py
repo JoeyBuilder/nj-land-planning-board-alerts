@@ -9,6 +9,12 @@ import requests
 import pdfplumber
 from bs4 import BeautifulSoup
 
+import time
+from urllib.parse import urlparse
+import warnings
+
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
 # =========================
 # CONFIG — EDIT THESE
 # =========================
@@ -99,16 +105,65 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
     return out
 
 
+import time
+from urllib.parse import urlparse
+
+BAD_HOSTS = {
+    "granicus_production_attachments.s3.amazonaws.com",
+    "granicus-production-attachments.s3.amazonaws.com",
+}
+
 def download_pdf(url: str) -> pathlib.Path:
     pdf_name = f"{sha1(url)}.pdf"
     path = DATA_DIR / pdf_name
     if path.exists():
         return path
 
-    r = requests.get(url, timeout=90, headers={"User-Agent": USER_AGENT})
-    r.raise_for_status()
-    path.write_bytes(r.content)
-    return path
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    # Try a few times in case of transient network issues
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            # Prefer to download via AgendaViewer URL if possible
+            # (AgendaViewer serves the PDF bytes and handles attachment routing)
+            r = session.get(url, timeout=90, allow_redirects=True)
+            r.raise_for_status()
+
+            # If we got HTML, we might have hit a viewer page; still save content only if it looks like PDF
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if "pdf" not in ctype and not r.content.startswith(b"%PDF"):
+                # Sometimes content-type is wrong; check signature
+                if not r.content.startswith(b"%PDF"):
+                    raise RuntimeError(f"Response did not look like a PDF (content-type={ctype})")
+
+            path.write_bytes(r.content)
+            return path
+
+        except requests.exceptions.SSLError as e:
+            last_err = e
+
+            # If the redirect target is the bad S3 host, try fetching with verify=False ONLY for that host
+            # (contained mitigation; you can remove this later if Granicus fixes cert)
+            parsed = urlparse(url)
+            if parsed.netloc in BAD_HOSTS:
+                try:
+                    r = session.get(url, timeout=90, allow_redirects=True, verify=False)
+                    r.raise_for_status()
+                    if not r.content.startswith(b"%PDF"):
+                        raise RuntimeError("verify=False fetch did not return a PDF")
+                    path.write_bytes(r.content)
+                    return path
+                except Exception as e2:
+                    last_err = e2
+
+        except Exception as e:
+            last_err = e
+
+        time.sleep(2 * attempt)
+
+    raise RuntimeError(f"Failed to download PDF after retries: {last_err}")
 
 
 def extract_text(pdf_path: pathlib.Path) -> str:
