@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 TARGET_PAGES = [
     # Put the EXACT page(s) that list Planning Board agendas/minutes PDFs.
     # Example: the page where you found the Dec 11, 2025 PDF link.
-    "https://www.winslowtownship.com/content/3296/3734/default.aspx",
+    "https://winslowtownship.granicus.com/ViewPublisher.php?view_id=1",
 ]
 
 # If the site uses relative links, we’ll join them against the page URL.
