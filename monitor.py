@@ -86,15 +86,24 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     links = []
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        full = requests.compat.urljoin(base_url, href)
+    rows = soup.find_all("tr")
 
-        # Catch direct PDFs and Granicus AgendaViewer links (sometimes no .pdf in URL)
-        if ".pdf" in full.lower() or "agendaviewer.php" in full.lower():
-            links.append(full)
+    for row in rows:
+        cells_text = row.get_text(" ", strip=True).lower()
 
-    # De-dupe but keep order
+        # Only keep Planning Board rows
+        if "planning board" not in cells_text:
+            continue
+
+        # Extract links from that row only
+        for a in row.find_all("a", href=True):
+            href = a["href"].strip()
+            full = requests.compat.urljoin(base_url, href)
+
+            if ".pdf" in full.lower() or "agendaviewer.php" in full.lower():
+                links.append(full)
+
+    # Remove duplicates, preserve order
     out = []
     seen = set()
     for l in links:
@@ -206,7 +215,7 @@ def main():
             print(f"[ERROR] Fetch page failed: {page_url} -> {e}")
             continue
 
-        pdf_links = extract_pdf_links(html, page_url)
+        pdf_links = pdf_links[:20]   # only most recent 20 docs
         print(f"[INFO] {page_url}: found {len(pdf_links)} pdf link(s)")
 
         for pdf_url in pdf_links:
