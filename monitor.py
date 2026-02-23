@@ -113,11 +113,34 @@ def sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+})
+
 def fetch_html(url: str) -> str:
-    r = requests.get(url, timeout=40, headers={"User-Agent": USER_AGENT})
+    r = SESSION.get(url, timeout=40, allow_redirects=True, verify=False)
     r.raise_for_status()
     return r.text
 
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+def normalize_url(u: str) -> str:
+    parts = urlsplit(u)
+    # De-dupe query params (you had cases with ?t=...&t=...)
+    qs = parse_qsl(parts.query, keep_blank_values=True)
+    seen = set()
+    qs2 = []
+    for k, v in qs:
+        if (k, v) in seen:
+            continue
+        seen.add((k, v))
+        qs2.append((k, v))
+    new_query = urlencode(qs2)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
 def extract_pdf_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -126,20 +149,29 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         full = requests.compat.urljoin(base_url, href)
+        full = normalize_url(full)
 
         low = full.lower()
-        # PDFs and common agenda viewers
-        if ".pdf" in low or "agendaviewer.php" in low:
+        path = urlsplit(full).path.lower()
+
+        # Keep Granicus viewer links
+        if "agendaviewer.php" in low:
+            links.append(full)
+            continue
+
+        # Keep only true direct PDF URLs
+        if path.endswith(".pdf"):
+            # Optional: skip Revize "Document Center/Department" paths (often 404/irrelevant)
+            if "document center" in path:
+                continue
             links.append(full)
 
     # Remove duplicates, preserve order
-    out = []
-    seen = set()
+    out, seen = [], set()
     for l in links:
         if l not in seen:
             out.append(l)
             seen.add(l)
-
     return out
 
 def download_pdf(url: str) -> pathlib.Path:
@@ -148,14 +180,10 @@ def download_pdf(url: str) -> pathlib.Path:
     if path.exists():
         return path
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-
     last_err = None
     for attempt in range(1, 4):
         try:
-            # IMPORTANT: verify=False because Granicus attachment host presents a cert mismatch
-            r = session.get(url, timeout=90, allow_redirects=True, verify=False)
+            r = SESSION.get(url, timeout=90, allow_redirects=True, verify=False)
             r.raise_for_status()
 
             ctype = (r.headers.get("Content-Type") or "").lower()
