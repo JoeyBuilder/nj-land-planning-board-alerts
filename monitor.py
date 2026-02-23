@@ -208,7 +208,7 @@ def main():
     seen = load_seen()
     new_relevant_hits = []
 
-    for page_url in TARGET_PAGES:
+for page_url in TARGET_PAGES:
     try:
         html = fetch_html(page_url)
     except Exception as e:
