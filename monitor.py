@@ -209,14 +209,15 @@ def main():
     new_relevant_hits = []
 
     for page_url in TARGET_PAGES:
-        try:
-            html = fetch_html(page_url)
-        except Exception as e:
-            print(f"[ERROR] Fetch page failed: {page_url} -> {e}")
-            continue
+    try:
+        html = fetch_html(page_url)
+    except Exception as e:
+        print(f"[ERROR] Fetch page failed: {page_url} -> {e}")
+        continue
 
-        pdf_links = pdf_links[:20]   # only most recent 20 docs
-        print(f"[INFO] {page_url}: found {len(pdf_links)} pdf link(s)")
+    pdf_links = extract_pdf_links(html, page_url)
+    pdf_links = pdf_links[:20]  # only most recent 20 docs
+    print(f"[INFO] {page_url}: found {len(pdf_links)} pdf link(s)")
 
         for pdf_url in pdf_links:
             if pdf_url in seen:
