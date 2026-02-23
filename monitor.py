@@ -219,7 +219,7 @@ for page_url in TARGET_PAGES:
     pdf_links = pdf_links[:20]  # only most recent 20 docs
     print(f"[INFO] {page_url}: found {len(pdf_links)} pdf link(s)")
 
-        for pdf_url in pdf_links:
+for pdf_url in pdf_links:
             if pdf_url in seen:
                 continue
 
