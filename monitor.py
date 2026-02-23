@@ -10,7 +10,6 @@ import pdfplumber
 from bs4 import BeautifulSoup
 
 import time
-from urllib.parse import urlparse
 import warnings
 
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
@@ -18,10 +17,48 @@ warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 # =========================
 # CONFIG — EDIT THESE
 # =========================
-TARGET_PAGES = [
-    # Put the EXACT page(s) that list Planning Board agendas/minutes PDFs.
-    # Example: the page where you found the Dec 11, 2025 PDF link.
-    "https://winslowtownship.granicus.com/ViewPublisher.php?view_id=1",
+TARGET_SITES = [
+    {"town": "Winslow", "url": "https://winslowtownship.granicus.com/ViewPublisher.php?view_id=1"},
+    {"town": "Cherry Hill", "url": "https://www.chnj.gov/AgendaCenter/Planning-Board-5"},
+    {"town": "Voorhees", "url": "https://voorheesnj.com/government/boards-committees/planning-board/"},
+    {"town": "Voorhees", "url": "https://voorheesnj.com/government/boards-committees/zoning-board/"},
+    {"town": "Mantua", "url": "https://mantuatownship.com/departments/zoning-land-use-code-enforcement/land-use-board-agenda-and-minutes/"},
+    {"town": "Mullica Hill", "url": "https://harrisontwp.us/department/joint-land-use-board/"},
+    {"town": "Williamstown", "url": "https://monroetownshipnj.org/5boards-and-commissions/planning-board/meeting-agendas/"},
+    {"town": "Williamstown", "url": "https://monroetownshipnj.org/meeting-agendas/"},
+    {"town": "Washington Township", "url": "https://www.twp.washington.nj.us/government/boards___commissions/planning_board/agendas_and_minutes.php"},
+    {"town": "Washington Township", "url": "https://www.twp.washington.nj.us/government/boards___commissions/zoning_board/agendas_and_minutes.php"},
+    {"town": "West Deptford", "url": "https://www.westdeptford.com/government/meeting_agendas/planning_board.php"},
+    {"town": "West Deptford", "url": "https://www.westdeptford.com/government/meeting_agendas/zoning_board.php"},
+    {"town": "Deptford", "url": "https://www.deptford-nj.org/government/agendas-minutes"},
+    {"town": "East Greenwich", "url": "https://www.eastgreenwichnj.com/government/planning-and-zoning"},
+    {"town": "Mt. Laurel", "url": "https://www.mountlaurel.com/government/meetings/planning_board_meetings.php"},
+    {"town": "Mt. Laurel", "url": "https://www.mountlaurel.com/government/meetings/zoning_board_meetings.php"},
+    {"town": "Medford", "url": "https://medfordtownship.com/planning-board/"},
+    {"town": "Medford Lakes", "url": "https://medfordtownship.com/zoningboard/"},
+    {"town": "Evesham", "url": "https://evesham-nj.org/meetings/meeting-documents/planning-board-meetings"},
+    {"town": "Evesham", "url": "https://evesham-nj.org/meetings/meeting-documents/board-of-adjustment-meetings"},
+    {"town": "Berlin Boro", "url": "https://www.berlinnj.org/planning-board/"},
+    {"town": "Hainesport", "url": "https://www.hainesporttownship.com/joint-land-use-board"},
+    {"town": "Lumberton", "url": "https://www.lumbertontwp.com/departments-services/land-development-board/"},
+    {"town": "Burlington", "url": "http://twp.burlington.nj.us/content/159/82/default.aspx"},
+    {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Search/?term=&CIDs=3,&startDate=3/28/2024&endDate=3/28/2025&dateRange=1%20year&dateSelector=4"},
+    {"town": "Delran", "url": "https://delrantownship.org/document-category/planning-board-agendas-minutes/"},
+    {"town": "Delran", "url": "https://delrantownship.org/zoning-board/"},
+    {"town": "Cinnaminson", "url": "https://cinnaminsonnj.org/agendas-resolutions-minutes/"},
+    {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-agendas/"},
+    {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-minutes/"},
+    {"town": "Woolwich", "url": "https://woolwichtwp.org/government/woolwich-township-minutes-agendas/"},
+    {"town": "Glassboro", "url": "https://drive.google.com/drive/folders/0B-l-QWJCLVkhdW52OHpZWFhLbm8?resourcekey=0-mbjKln7-ZtBHmHijO_ZIPg"},
+    {"town": "Hammonton", "url": "https://www.townofhammonton.org/land-use-board/"},
+    {"town": "Southampton", "url": "https://www.southamptonnj.org/government/meetings/land_development_board_.php"},
+    {"town": "Eastampton", "url": "https://www.eastampton.com/meetings?field_smart_date_value_1=&field_smart_date_end_value=&combine=&department=133&boards-commissions=All"},
+    {"town": "Westampton", "url": "https://www.westamptonnj.gov/node/32/agenda"},
+    {"town": "Pemberton Township", "url": "https://www.pemberton-twp.com/government/minutes_ordinances/current_year_meeting_minutes.php"},
+    {"town": "Shamong", "url": "https://www.shamong.net/community_county_burlington/meetingsagendasminutes/joint_land_use_board_jlub.php#outer-764sub-771"},
+    {"town": "Tabernackle", "url": "https://www.townshipoftabernacle-nj.gov/departments/land_development_board/meeting_minutes.php"},
+    {"town": "Swedesboro", "url": "https://ecode360.com/SW0669/documents/Minutes#category-89893453"},
+    {"town": "Swedesboro", "url": "https://ecode360.com/SW0669/documents/Agendas#category-89874773"},
 ]
 
 # If the site uses relative links, we’ll join them against the page URL.
@@ -86,22 +123,14 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     links = []
 
-    rows = soup.find_all("tr")
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        full = requests.compat.urljoin(base_url, href)
 
-    for row in rows:
-        cells_text = row.get_text(" ", strip=True).lower()
-
-        # Only keep Planning Board rows
-        if "planning board" not in cells_text:
-            continue
-
-        # Extract links from that row only
-        for a in row.find_all("a", href=True):
-            href = a["href"].strip()
-            full = requests.compat.urljoin(base_url, href)
-
-            if ".pdf" in full.lower() or "agendaviewer.php" in full.lower():
-                links.append(full)
+        low = full.lower()
+        # PDFs and common agenda viewers
+        if ".pdf" in low or "agendaviewer.php" in low:
+            links.append(full)
 
     # Remove duplicates, preserve order
     out = []
@@ -112,15 +141,6 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
             seen.add(l)
 
     return out
-
-
-import time
-from urllib.parse import urlparse
-
-BAD_HOSTS = {
-    "granicus_production_attachments.s3.amazonaws.com",
-    "granicus-production-attachments.s3.amazonaws.com",
-}
 
 def download_pdf(url: str) -> pathlib.Path:
     pdf_name = f"{sha1(url)}.pdf"
@@ -208,37 +228,42 @@ def main():
     seen = load_seen()
     new_relevant_hits = []
 
-    for page_url in TARGET_PAGES:
+    for site in TARGET_SITES:
+        town = site["town"]
+        page_url = site["url"]
+
         try:
             html = fetch_html(page_url)
         except Exception as e:
-            print(f"[ERROR] Fetch page failed: {page_url} -> {e}")
+            print(f"[ERROR] Fetch page failed: {town} {page_url} -> {e}")
             continue
 
         pdf_links = extract_pdf_links(html, page_url)
-        pdf_links = pdf_links[:20]  # only most recent 20 docs
-        print(f"[INFO] {page_url}: found {len(pdf_links)} pdf link(s)")
+        pdf_links = pdf_links[:20]  # limit per site
+        print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
         for pdf_url in pdf_links:
             if pdf_url in seen:
                 continue
 
-            seen.add(pdf_url)
-
             try:
                 pdf_path = download_pdf(pdf_url)
+                seen.add(pdf_url) # ✅ mark seen only after successful download
+                
                 text = extract_text(pdf_path)
                 result = analyze_text(text)
 
                 if result["relevant"]:
                     new_relevant_hits.append({
+                        "town": town,
+                        "source_page": page_url,
                         "pdf_url": pdf_url,
                         "keyword_hits": result["keyword_hits"],
                         "block_lot_snippets": result["block_lot_snippets"],
                     })
 
             except Exception as e:
-                print(f"[ERROR] PDF process failed: {pdf_url} -> {e}")
+                print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
 
     save_seen(seen)
 
@@ -250,6 +275,8 @@ def main():
     lines.append("New subdivision-related document(s) detected.\n")
 
     for hit in new_relevant_hits:
+        lines.append(f"**Town:** {hit['town']}")
+        lines.append(f"**Source page:** {hit['source_page']}")
         lines.append(f"**PDF:** {hit['pdf_url']}")
         if hit["keyword_hits"]:
             lines.append(f"**Keywords:** {', '.join(hit['keyword_hits'])}")
