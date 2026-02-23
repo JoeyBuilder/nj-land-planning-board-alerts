@@ -208,22 +208,21 @@ def main():
     seen = load_seen()
     new_relevant_hits = []
 
-for page_url in TARGET_PAGES:
-    try:
-        html = fetch_html(page_url)
-    except Exception as e:
-        print(f"[ERROR] Fetch page failed: {page_url} -> {e}")
-        continue
+    for page_url in TARGET_PAGES:
+        try:
+            html = fetch_html(page_url)
+        except Exception as e:
+            print(f"[ERROR] Fetch page failed: {page_url} -> {e}")
+            continue
 
-    pdf_links = extract_pdf_links(html, page_url)
-    pdf_links = pdf_links[:20]  # only most recent 20 docs
-    print(f"[INFO] {page_url}: found {len(pdf_links)} pdf link(s)")
+        pdf_links = extract_pdf_links(html, page_url)
+        pdf_links = pdf_links[:20]  # only most recent 20 docs
+        print(f"[INFO] {page_url}: found {len(pdf_links)} pdf link(s)")
 
-for pdf_url in pdf_links:
+        for pdf_url in pdf_links:
             if pdf_url in seen:
                 continue
 
-            # Mark it seen early to prevent reprocessing loops
             seen.add(pdf_url)
 
             try:
@@ -247,9 +246,9 @@ for pdf_url in pdf_links:
         print("[INFO] No new relevant subdivision docs.")
         return
 
-    # Build issue content
     lines = []
     lines.append("New subdivision-related document(s) detected.\n")
+
     for hit in new_relevant_hits:
         lines.append(f"**PDF:** {hit['pdf_url']}")
         if hit["keyword_hits"]:
@@ -258,7 +257,7 @@ for pdf_url in pdf_links:
             lines.append("**Block/Lot snippets:**")
             for s in hit["block_lot_snippets"]:
                 lines.append(f"- {s}")
-        lines.append("")  # blank line
+        lines.append("")
 
     body = "\n".join(lines)
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -266,7 +265,6 @@ for pdf_url in pdf_links:
 
     create_github_issue(title=title, body=body)
     print("[INFO] GitHub Issue created.")
-
 
 if __name__ == "__main__":
     main()
