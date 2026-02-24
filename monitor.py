@@ -1,22 +1,22 @@
 import os
 import re
 import json
+import time
 import hashlib
 import pathlib
+import warnings
+import logging
 from datetime import datetime
+from typing import Optional
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote
 
 import requests
 import pdfplumber
 from bs4 import BeautifulSoup
 
-import time
-import warnings
-import logging
-
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
-
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 logging.getLogger("pdfminer").setLevel(logging.ERROR)  # silence FontBBox/pdfminer noise
+
 
 # =========================
 # CONFIG — EDIT THESE
@@ -79,6 +79,7 @@ KEYWORDS = [
     "memorialization",
 ]
 
+# NJ-style parcel pattern: Block ####(.## optional) + Lot/Lots ...
 BLOCK_LOT_REGEX = re.compile(
     r"\bBlock\s*\d+(?:\.\d+)?\b[\s\S]{0,120}?\bLot(?:s)?\s*[\d][\d,\s&\-\.\(\)]*",
     re.IGNORECASE,
@@ -98,11 +99,13 @@ LINK_HINTS = (
     "joint land use",
 )
 
-# Where we store downloaded PDFs + the “seen links” list
+# Storage
 DATA_DIR = pathlib.Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen_links.json"
+FAILED_FILE = DATA_DIR / "dead_links.json"
 
+# GitHub issue creation settings
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
 
@@ -110,17 +113,33 @@ REPO = os.getenv("GITHUB_REPOSITORY")
 # =========================
 # Helpers
 # =========================
+def _load_set(path: pathlib.Path) -> set[str]:
+    if not path.exists():
+        return set()
+    try:
+        return set(json.loads(path.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _save_set(path: pathlib.Path, s: set[str]) -> None:
+    path.write_text(json.dumps(sorted(s), indent=2), encoding="utf-8")
+
+
 def load_seen() -> set[str]:
-    if SEEN_FILE.exists():
-        try:
-            return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
-        except Exception:
-            return set()
-    return set()
+    return _load_set(SEEN_FILE)
 
 
 def save_seen(seen: set[str]) -> None:
-    SEEN_FILE.write_text(json.dumps(sorted(seen), indent=2), encoding="utf-8")
+    _save_set(SEEN_FILE, seen)
+
+
+def load_failed() -> set[str]:
+    return _load_set(FAILED_FILE)
+
+
+def save_failed(failed: set[str]) -> None:
+    _save_set(FAILED_FILE, failed)
 
 
 def sha1(s: str) -> str:
@@ -141,31 +160,80 @@ SESSION.headers.update(
 )
 
 
-def fetch_html(url: str) -> str:
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            r = SESSION.get(url, timeout=40, allow_redirects=True, verify=False)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last_err = e
-            time.sleep(2 * attempt)
-    raise RuntimeError(last_err)
+def canonicalize_url(u: str) -> str:
+    """
+    - Percent-encode unsafe path chars (spaces, &, commas, etc.)
+    - De-dupe query params by KEY (keep last)
+    - Drop common cachebuster params (Revize often uses t=)
+    """
+    parts = urlsplit(u)
+
+    # Encode path safely (keep / intact)
+    safe_path = quote(parts.path, safe="/")
+
+    # De-dupe by KEY (keep last occurrence)
+    qs = parse_qsl(parts.query, keep_blank_values=True)
+    kv: dict[str, str] = {}
+    for k, v in qs:
+        kv[k] = v
+
+    kv.pop("t", None)
+    kv.pop("_", None)
+
+    new_query = urlencode(list(kv.items()), doseq=False)
+    return urlunsplit((parts.scheme, parts.netloc, safe_path, new_query, parts.fragment))
 
 
 def normalize_url(u: str) -> str:
-    parts = urlsplit(u)
-    qs = parse_qsl(parts.query, keep_blank_values=True)
-    seen = set()
-    qs2 = []
-    for k, v in qs:
-        if (k, v) in seen:
-            continue
-        seen.add((k, v))
-        qs2.append((k, v))
-    new_query = urlencode(qs2)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    # alias for older name
+    return canonicalize_url(u)
+
+
+def fetch_html(url: str) -> str:
+    """
+    Fetch HTML with:
+    - retry
+    - fallback to r.jina.ai proxy when basic bot blocks occur (403/406/429)
+    - DNS fallback: retry without leading www.
+    """
+    last_err: Optional[Exception] = None
+
+    def via_jina(u: str) -> str:
+        # jina requires full URL (http/https)
+        r = SESSION.get(f"https://r.jina.ai/{u}", timeout=60, allow_redirects=True, verify=False)
+        r.raise_for_status()
+        return r.text
+
+    for attempt in range(1, 4):
+        try:
+            r = SESSION.get(url, timeout=40, allow_redirects=True, verify=False)
+            if r.status_code in (403, 406, 429):
+                return via_jina(url)
+            r.raise_for_status()
+            return r.text
+
+        except requests.exceptions.ConnectionError as e:
+            parts = urlsplit(url)
+            if parts.netloc.startswith("www."):
+                alt = urlunsplit((parts.scheme, parts.netloc[4:], parts.path, parts.query, parts.fragment))
+                try:
+                    r2 = SESSION.get(alt, timeout=40, allow_redirects=True, verify=False)
+                    if r2.status_code in (403, 406, 429):
+                        return via_jina(alt)
+                    r2.raise_for_status()
+                    return r2.text
+                except Exception as e2:
+                    last_err = e2
+            else:
+                last_err = e
+
+            time.sleep(2 * attempt)
+
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * attempt)
+
+    raise RuntimeError(str(last_err) if last_err else "Unknown fetch_html error")
 
 
 def looks_like_board_doc(a_tag) -> bool:
@@ -193,19 +261,16 @@ def extract_agendacenter_links(html: str, base_url: str) -> list[str]:
         full = normalize_url(full)
         low = full.lower()
 
-        # Core AgendaCenter file endpoint patterns
         if "/agendacenter/viewfile/" in low:
-            # Prefer agendas/minutes/packets; skip random viewfile types if any
             if any(seg in low for seg in ("/agenda/", "/minutes/", "/packet/")):
                 links.append(full)
                 continue
 
-        # Some civicplus sites use "ViewFile" with query params or other casing
         if "agendacenter" in low and "viewfile" in low and any(k in low for k in ("agenda", "minutes", "packet")):
             links.append(full)
 
-    # de-dupe preserve order
-    out, seen = [], set()
+    out: list[str] = []
+    seen: set[str] = set()
     for l in links:
         if l not in seen:
             out.append(l)
@@ -217,13 +282,10 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     links: list[str] = []
 
-    base_low = base_url.lower()
-    if "/agendacenter/" in base_low:
-        # add civicplus-specific file links
+    if "/agendacenter/" in base_url.lower():
         links.extend(extract_agendacenter_links(html, base_url))
 
     for a in soup.find_all("a", href=True):
-        # Only chase links that look like agendas/minutes/boards
         if not looks_like_board_doc(a):
             continue
 
@@ -234,17 +296,17 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
         low = full.lower()
         path = urlsplit(full).path.lower()
 
-        # Keep Granicus viewer links
+        # Granicus agenda viewer links (not direct PDFs, but still useful)
         if "agendaviewer.php" in low:
             links.append(full)
             continue
 
-        # Keep AgendaCenter ViewFile links even without .pdf
+        # AgendaCenter ViewFile links (often PDF response even without .pdf)
         if "/agendacenter/viewfile/" in low and any(seg in low for seg in ("/agenda/", "/minutes/", "/packet/")):
             links.append(full)
             continue
 
-        # Keep only true direct PDF URLs
+        # Direct PDFs only
         if path.endswith(".pdf"):
             # Skip Revize "document center" variants (often irrelevant or 404)
             doccenter_markers = ("documentcenter", "document_center", "document%20center", "document center")
@@ -252,8 +314,8 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
                 continue
             links.append(full)
 
-    # Remove duplicates, preserve order
-    out, seen = [], set()
+    out: list[str] = []
+    seen: set[str] = set()
     for l in links:
         if l not in seen:
             out.append(l)
@@ -261,49 +323,73 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
     return out
 
 
-def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
+def download_pdf(url: str, referer: Optional[str] = None) -> pathlib.Path:
+    url = canonicalize_url(url)
+
     pdf_name = f"{sha1(url)}.pdf"
     path = DATA_DIR / pdf_name
     if path.exists():
         return path
 
-    last_err = None
+    last_err: Optional[Exception] = None
+
+    # Try a small set of fallback URL variants
+    candidates: list[str] = [url]
+
+    parts = urlsplit(url)
+
+    # Variant: drop ALL query params
+    no_query = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    if no_query != url:
+        candidates.append(no_query)
+
+    # Variant: try adding www. if absent (cheap attempt)
+    if parts.netloc and not parts.netloc.startswith("www."):
+        www = urlunsplit((parts.scheme, "www." + parts.netloc, parts.path, parts.query, parts.fragment))
+        candidates.append(canonicalize_url(www))
+
     for attempt in range(1, 4):
-        try:
-            headers = {}
-            if referer:
-                headers["Referer"] = referer
+        for cand in candidates:
+            try:
+                headers = {}
+                if referer:
+                    headers["Referer"] = referer
 
-            r = SESSION.get(
-                url,
-                timeout=90,
-                allow_redirects=True,
-                verify=False,
-                headers=headers,
-                stream=True,
-            )
-            r.raise_for_status()
+                r = SESSION.get(
+                    cand,
+                    timeout=90,
+                    allow_redirects=True,
+                    verify=False,
+                    headers=headers,
+                    stream=True,
+                )
 
-            # read small chunk first, then full
-            first = r.raw.read(5, decode_content=True)
-            content = first + r.content
+                # If 404, try next candidate immediately
+                if r.status_code == 404:
+                    continue
 
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            if "pdf" not in ctype and not content.startswith(b"%PDF"):
-                raise RuntimeError(f"Response did not look like a PDF (content-type={ctype})")
+                r.raise_for_status()
 
-            path.write_bytes(content)
-            return path
+                first = r.raw.read(5, decode_content=True)
+                content = first + r.content
 
-        except Exception as e:
-            last_err = e
-            time.sleep(2 * attempt)
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                if "pdf" not in ctype and not content.startswith(b"%PDF"):
+                    raise RuntimeError(f"Response did not look like a PDF (content-type={ctype})")
+
+                path.write_bytes(content)
+                return path
+
+            except Exception as e:
+                last_err = e
+
+        time.sleep(2 * attempt)
 
     raise RuntimeError(f"Failed to download PDF after retries: {last_err}")
 
 
 def extract_text(pdf_path: pathlib.Path) -> str:
-    parts = []
+    parts: list[str] = []
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page in pdf.pages:
             t = page.extract_text() or ""
@@ -316,7 +402,7 @@ def analyze_text(text: str) -> dict:
     lower = text.lower()
     keyword_hits = [k for k in KEYWORDS if k in lower]
 
-    snippets = []
+    snippets: list[str] = []
     for m in re.finditer(BLOCK_LOT_REGEX, text):
         snippet = m.group(0).replace("\n", " ").strip()
         snippets.append(snippet[:240])
@@ -335,10 +421,7 @@ def create_github_issue(title: str, body: str) -> None:
         raise RuntimeError("Missing GITHUB_TOKEN or GITHUB_REPOSITORY environment variables")
 
     url = f"https://api.github.com/repos/{REPO}/issues"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
     payload = {"title": title, "body": body}
 
     r = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -350,7 +433,8 @@ def create_github_issue(title: str, body: str) -> None:
 # =========================
 def main():
     seen = load_seen()
-    new_relevant_hits = []
+    failed = load_failed()
+    new_relevant_hits: list[dict] = []
 
     for site in TARGET_SITES:
         town = site["town"]
@@ -362,12 +446,13 @@ def main():
             print(f"[ERROR] Fetch page failed: {town} {page_url} -> {e}")
             continue
 
-        pdf_links = extract_pdf_links(html, page_url)
-        pdf_links = pdf_links[:20]
+        pdf_links = extract_pdf_links(html, page_url)[:20]
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
-        for pdf_url in pdf_links:
-            if pdf_url in seen:
+        for raw_pdf_url in pdf_links:
+            pdf_url = canonicalize_url(raw_pdf_url)
+
+            if pdf_url in seen or pdf_url in failed:
                 continue
 
             try:
@@ -391,14 +476,19 @@ def main():
             except Exception as e:
                 print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
 
+                # ✅ record hard failures so we don't keep retrying every run
+                msg = str(e)
+                if "404" in msg or "Not Found" in msg:
+                    failed.add(pdf_url)
+
     save_seen(seen)
+    save_failed(failed)
 
     if not new_relevant_hits:
         print("[INFO] No new relevant subdivision docs.")
         return
 
-    lines = []
-    lines.append("New subdivision-related document(s) detected.\n")
+    lines: list[str] = ["New subdivision-related document(s) detected.\n"]
 
     for hit in new_relevant_hits:
         lines.append(f"**Town:** {hit['town']}")
