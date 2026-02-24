@@ -402,8 +402,9 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
 
         time.sleep(2 * attempt)
 
-        if last_err is None:
+    if last_err is None:
         raise RuntimeError("All download candidates returned 404 Not Found")
+
     raise RuntimeError(f"Failed to download PDF after retries: {last_err}")
 
 def extract_text(pdf_path: pathlib.Path) -> str:
