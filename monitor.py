@@ -8,7 +8,7 @@ import warnings
 import logging
 from datetime import datetime
 from typing import Optional
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote, unquote
 
 import requests
 import pdfplumber
@@ -406,6 +406,56 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
             filtered.append(u)
 
     return filtered or out
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    out = []
+    seen = set()
+    for x in items:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
+
+
+def find_alternate_pdf_urls(original_pdf_url: str, referer_url: str) -> list[str]:
+    """
+    If a site returns 404 for a "pretty" PDF URL, try to discover the *real*
+    PDF link from the referer page HTML (Revize often hosts on cms*.revize.com).
+    Matches by filename (decoded) and also collects any Revize-hosted PDFs.
+    """
+    try:
+        html = fetch_html(referer_url)
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # filename match (decode so %20 and spaces match)
+    orig_path = urlsplit(original_pdf_url).path
+    orig_name = unquote(orig_path.split("/")[-1]).lower().strip()
+
+    candidates: list[str] = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        full = requests.compat.urljoin(referer_url, href)
+        full = normalize_url(full)
+
+        p = urlsplit(full).path.lower()
+        if not p.endswith(".pdf"):
+            continue
+
+        name = unquote(p.split("/")[-1]).lower().strip()
+
+        # Strong match: same filename
+        if orig_name and name == orig_name:
+            candidates.append(full)
+            continue
+
+        # Helpful extra: any Revize-hosted PDF (often the real storage host)
+        if "revize.com" in full.lower() or "cms" in urlsplit(full).netloc.lower():
+            candidates.append(full)
+
+    return _dedupe_keep_order(candidates)
 
 def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     url = canonicalize_url(url)
@@ -420,18 +470,33 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     candidates = [url]
     parts = urlsplit(url)
 
+    # Candidate: strip query
     no_query = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
     if no_query != url:
         candidates.append(no_query)
 
+    # Candidate: add www
     if parts.netloc and not parts.netloc.startswith("www."):
         www = urlunsplit((parts.scheme, "www." + parts.netloc, parts.path, parts.query, parts.fragment))
         candidates.append(canonicalize_url(www))
 
+    # Candidate: duplicate t=... if present once (some Revize links behave oddly)
+    qs = parse_qsl(parts.query, keep_blank_values=True)
+    t_vals = [v for (k, v) in qs if k.lower() == "t"]
+    if len(t_vals) == 1:
+        qs2 = qs + [("t", t_vals[0])]
+        dup_t = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(qs2, doseq=True), parts.fragment))
+        candidates.append(canonicalize_url(dup_t))
+
+    candidates = _dedupe_keep_order(candidates)
+
+    # We only want to do the "scrape referer for alternates" once
+    alternates_added = False
+
     for attempt in range(1, 4):
         saw_non_404 = False
 
-        for cand in candidates:
+        for cand in list(candidates):
             try:
                 headers = {}
                 if referer:
@@ -447,6 +512,13 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
                 )
 
                 if r.status_code == 404:
+                    # If we got a 404 and we have a referer page, try to find the real PDF URL there
+                    if referer and not alternates_added:
+                        alts = find_alternate_pdf_urls(original_pdf_url=url, referer_url=referer)
+                        if alts:
+                            candidates.extend(alts)
+                            candidates[:] = _dedupe_keep_order(candidates)
+                        alternates_added = True
                     continue
 
                 saw_non_404 = True
@@ -465,7 +537,7 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
             except Exception as e:
                 last_err = e
 
-        # if we tried everything and ONLY got 404s, stop retrying
+        # If we tried everything and ONLY got 404s, stop retrying
         if not saw_non_404:
             raise RuntimeError("All download candidates returned 404 Not Found")
 
