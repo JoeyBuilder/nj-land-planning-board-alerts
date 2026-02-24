@@ -610,7 +610,7 @@ def main():
         pdf_links = pdf_links[:20]
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
-            for link in pdf_links:
+        for link in pdf_links:
             # ✅ skip anything we already processed OR already know is dead
             if link in seen or link in failed:
                 continue
