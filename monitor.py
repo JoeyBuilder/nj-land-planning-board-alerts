@@ -105,6 +105,17 @@ DATA_DIR.mkdir(exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen_links.json"
 FAILED_FILE = DATA_DIR / "dead_links.json"
 
+def load_failed() -> set[str]:
+    if FAILED_FILE.exists():
+        try:
+            return set(json.loads(FAILED_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            return set()
+    return set()
+
+def save_failed(failed: set[str]) -> None:
+    FAILED_FILE.write_text(json.dumps(sorted(failed), indent=2), encoding="utf-8")
+
 # GitHub issue creation settings
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
@@ -160,29 +171,33 @@ SESSION.headers.update(
 )
 
 
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote, unquote
+
 def canonicalize_url(u: str) -> str:
     """
-    - Percent-encode unsafe path chars (spaces, &, commas, etc.)
-    - De-dupe query params by KEY (keep last)
-    - Drop common cachebuster params (Revize often uses t=)
+    - Fix double-encoding by decoding the path first, then re-encoding safely
+    - Remove duplicate query params (by key, keep the last)
+    - Drop cachebuster params like t=
     """
     parts = urlsplit(u)
 
-    # Encode path safely (keep / intact)
-    safe_path = quote(parts.path, safe="/")
+    # 1) Fix double-encoding in the path
+    # Decode any existing escapes, then re-encode.
+    decoded_path = unquote(parts.path)
+    safe_path = quote(decoded_path, safe="/%")
 
-    # De-dupe by KEY (keep last occurrence)
+    # 2) De-dupe query params by KEY (keep last)
     qs = parse_qsl(parts.query, keep_blank_values=True)
-    kv: dict[str, str] = {}
+    kv = {}
     for k, v in qs:
         kv[k] = v
 
+    # 3) Drop common cachebuster keys (Revize uses t=)
     kv.pop("t", None)
     kv.pop("_", None)
 
-    new_query = urlencode(list(kv.items()), doseq=False)
+    new_query = urlencode(kv.items(), doseq=False)
     return urlunsplit((parts.scheme, parts.netloc, safe_path, new_query, parts.fragment))
-
 
 def normalize_url(u: str) -> str:
     # alias for older name
@@ -323,7 +338,7 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
     return out
 
 
-def download_pdf(url: str, referer: Optional[str] = None) -> pathlib.Path:
+def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     url = canonicalize_url(url)
 
     pdf_name = f"{sha1(url)}.pdf"
@@ -331,24 +346,22 @@ def download_pdf(url: str, referer: Optional[str] = None) -> pathlib.Path:
     if path.exists():
         return path
 
-    last_err: Optional[Exception] = None
+    last_err = None
 
-    # Try a small set of fallback URL variants
-    candidates: list[str] = [url]
-
+    candidates = [url]
     parts = urlsplit(url)
 
-    # Variant: drop ALL query params
     no_query = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
     if no_query != url:
         candidates.append(no_query)
 
-    # Variant: try adding www. if absent (cheap attempt)
     if parts.netloc and not parts.netloc.startswith("www."):
         www = urlunsplit((parts.scheme, "www." + parts.netloc, parts.path, parts.query, parts.fragment))
         candidates.append(canonicalize_url(www))
 
     for attempt in range(1, 4):
+        saw_non_404 = False
+
         for cand in candidates:
             try:
                 headers = {}
@@ -364,10 +377,10 @@ def download_pdf(url: str, referer: Optional[str] = None) -> pathlib.Path:
                     stream=True,
                 )
 
-                # If 404, try next candidate immediately
                 if r.status_code == 404:
                     continue
 
+                saw_non_404 = True
                 r.raise_for_status()
 
                 first = r.raw.read(5, decode_content=True)
@@ -383,10 +396,15 @@ def download_pdf(url: str, referer: Optional[str] = None) -> pathlib.Path:
             except Exception as e:
                 last_err = e
 
+        # if we tried everything and ONLY got 404s, stop retrying
+        if not saw_non_404:
+            raise RuntimeError("All download candidates returned 404 Not Found")
+
         time.sleep(2 * attempt)
 
+        if last_err is None:
+        raise RuntimeError("All download candidates returned 404 Not Found")
     raise RuntimeError(f"Failed to download PDF after retries: {last_err}")
-
 
 def extract_text(pdf_path: pathlib.Path) -> str:
     parts: list[str] = []
@@ -433,8 +451,8 @@ def create_github_issue(title: str, body: str) -> None:
 # =========================
 def main():
     seen = load_seen()
-    failed = load_failed()
-    new_relevant_hits: list[dict] = []
+    failed = load_failed()   # ✅ add
+    new_relevant_hits = []
 
     for site in TARGET_SITES:
         town = site["town"]
@@ -446,12 +464,12 @@ def main():
             print(f"[ERROR] Fetch page failed: {town} {page_url} -> {e}")
             continue
 
-        pdf_links = extract_pdf_links(html, page_url)[:20]
+        pdf_links = extract_pdf_links(html, page_url)
+        pdf_links = pdf_links[:20]
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
-        for raw_pdf_url in pdf_links:
-            pdf_url = canonicalize_url(raw_pdf_url)
-
+        for pdf_url in pdf_links:
+            # ✅ skip anything we already processed OR already know is dead
             if pdf_url in seen or pdf_url in failed:
                 continue
 
@@ -474,21 +492,22 @@ def main():
                     )
 
             except Exception as e:
-                print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
-
-                # ✅ record hard failures so we don't keep retrying every run
-                msg = str(e)
-                if "404" in msg or "Not Found" in msg:
+                # ✅ mark dead links so we don't retry them forever
+                msg = str(e).lower()
+                if "404" in msg or "not found" in msg:
                     failed.add(pdf_url)
 
+                print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
+
     save_seen(seen)
-    save_failed(failed)
+    save_failed(failed)  # ✅ add
 
     if not new_relevant_hits:
         print("[INFO] No new relevant subdivision docs.")
         return
 
-    lines: list[str] = ["New subdivision-related document(s) detected.\n"]
+    lines = []
+    lines.append("New subdivision-related document(s) detected.\n")
 
     for hit in new_relevant_hits:
         lines.append(f"**Town:** {hit['town']}")
@@ -508,7 +527,6 @@ def main():
 
     create_github_issue(title=title, body=body)
     print("[INFO] GitHub Issue created.")
-
 
 if __name__ == "__main__":
     main()
