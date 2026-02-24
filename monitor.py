@@ -332,6 +332,80 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
             seen.add(l)
     return out
 
+def is_viewer_page(url: str) -> bool:
+    """
+    Detect pages that are likely HTML viewers (not direct PDFs).
+    We only treat these as viewer pages if they are NOT already a direct PDF
+    and NOT an AgendaCenter ViewFile endpoint.
+    """
+    low = url.lower()
+    path = urlsplit(url).path.lower()
+
+    if path.endswith(".pdf"):
+        return False
+    if "/agendacenter/viewfile/" in low:
+        return False
+
+    # common viewer patterns
+    return (
+        path.endswith(".php")
+        or "agendaviewer.php" in low
+        or "viewpublisher.php" in low
+    )
+
+def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
+    """
+    Fetch an HTML viewer page (.php etc) and pull out real PDF links inside it.
+    Also captures AgendaCenter ViewFile links (which return PDFs even w/o .pdf).
+    """
+    html = fetch_html(viewer_url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    found: list[str] = []
+
+    def add(u: str) -> None:
+        u = normalize_url(u)
+        # keep direct PDFs
+        if urlsplit(u).path.lower().endswith(".pdf"):
+            found.append(u)
+            return
+        # keep civicplus viewfile endpoints
+        low = u.lower()
+        if "/agendacenter/viewfile/" in low and any(seg in low for seg in ("/agenda/", "/minutes/", "/packet/")):
+            found.append(u)
+
+    # <a href="...">
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        full = requests.compat.urljoin(viewer_url, href)
+        add(full)
+
+    # sometimes viewer embeds PDFs via iframe/embed src
+    for tag in soup.find_all(["iframe", "embed"], src=True):
+        src = (tag.get("src") or "").strip()
+        if not src:
+            continue
+        full = requests.compat.urljoin(viewer_url, src)
+        add(full)
+
+    # De-dupe preserve order
+    out: list[str] = []
+    seen_local: set[str] = set()
+    for u in found:
+        if u not in seen_local:
+            out.append(u)
+            seen_local.add(u)
+
+    # Optional: filter down to “board-ish” docs to avoid random PDFs
+    filtered: list[str] = []
+    for u in out:
+        ulow = u.lower()
+        if any(h in ulow for h in LINK_HINTS) or "agendacenter/viewfile" in ulow:
+            filtered.append(u)
+
+    return filtered or out
 
 def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     url = canonicalize_url(url)
@@ -464,36 +538,57 @@ def main():
         pdf_links = pdf_links[:20]
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
-        for pdf_url in pdf_links:
+                for link in pdf_links:
             # ✅ skip anything we already processed OR already know is dead
-            if pdf_url in seen or pdf_url in failed:
+            if link in seen or link in failed:
                 continue
 
-            try:
-                pdf_path = download_pdf(pdf_url, referer=page_url)
-                seen.add(pdf_url)  # ✅ only after successful download
+            # If this is a viewer page (.php / AgendaViewer.php / etc),
+            # resolve it to real PDF links first.
+            candidate_pdfs = [link]
+            if is_viewer_page(link):
+                try:
+                    resolved = resolve_viewer_to_pdfs(link)
+                    if resolved:
+                        candidate_pdfs = resolved
+                    else:
+                        # mark viewer as dead-ish so we don't keep hitting it
+                        failed.add(link)
+                        continue
+                except Exception as e:
+                    print(f"[ERROR] Viewer resolve failed: {town} {link} -> {e}")
+                    continue
 
-                text = extract_text(pdf_path)
-                result = analyze_text(text)
+            # Process each PDF candidate (some viewer pages contain multiple PDFs)
+            for pdf_url in candidate_pdfs:
+                if pdf_url in seen or pdf_url in failed:
+                    continue
 
-                if result["relevant"]:
-                    new_relevant_hits.append(
-                        {
-                            "town": town,
-                            "source_page": page_url,
-                            "pdf_url": pdf_url,
-                            "keyword_hits": result["keyword_hits"],
-                            "block_lot_snippets": result["block_lot_snippets"],
-                        }
-                    )
+                try:
+                    pdf_path = download_pdf(pdf_url, referer=page_url)
+                    seen.add(pdf_url)  # ✅ only after successful download
 
-            except Exception as e:
-                # ✅ mark dead links so we don't retry them forever
-                msg = str(e).lower()
-                if "404" in msg or "not found" in msg:
-                    failed.add(pdf_url)
+                    text = extract_text(pdf_path)
+                    result = analyze_text(text)
 
-                print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
+                    if result["relevant"]:
+                        new_relevant_hits.append(
+                            {
+                                "town": town,
+                                "source_page": page_url,
+                                "pdf_url": pdf_url,
+                                "keyword_hits": result["keyword_hits"],
+                                "block_lot_snippets": result["block_lot_snippets"],
+                            }
+                        )
+
+                except Exception as e:
+                    # ✅ mark dead links so we don't retry them forever
+                    msg = str(e).lower()
+                    if "404" in msg or "not found" in msg:
+                        failed.add(pdf_url)
+
+                    print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
 
     save_seen(seen)
     save_failed(failed)  # ✅ add
