@@ -174,35 +174,30 @@ SESSION.headers.update(
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote, unquote
 
 def canonicalize_url(u: str) -> str:
-    """
-    - Fix double-encoding by decoding the path first, then re-encoding safely
-    - Remove duplicate query params (by key, keep the last)
-    - Drop cachebuster params like t=
-    """
     parts = urlsplit(u)
 
-    # 1) Fix double-encoding in the path
-    # Decode any existing escapes, then re-encode.
+    # Fix double encoding
     decoded_path = unquote(parts.path)
     safe_path = quote(decoded_path, safe="/%")
 
-    # 2) De-dupe query params by KEY (keep last)
+    # De-dupe query params by key
     qs = parse_qsl(parts.query, keep_blank_values=True)
     kv = {}
     for k, v in qs:
         kv[k] = v
 
-    # 3) Drop common cachebuster keys (Revize uses t=)
+    # Drop cachebusters
     kv.pop("t", None)
     kv.pop("_", None)
 
-    new_query = urlencode(kv.items(), doseq=False)
-    return urlunsplit((parts.scheme, parts.netloc, safe_path, new_query, parts.fragment))
+    # ✅ FIX HERE
+    new_query = urlencode(kv, doseq=False)
 
+    return urlunsplit((parts.scheme, parts.netloc, safe_path, new_query, parts.fragment))
+    
 def normalize_url(u: str) -> str:
     # alias for older name
     return canonicalize_url(u)
-
 
 def fetch_html(url: str) -> str:
     """
