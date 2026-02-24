@@ -170,33 +170,33 @@ SESSION.headers.update(
     }
 )
 
-
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote, unquote
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, unquote, quote
 
 def canonicalize_url(u: str) -> str:
+    """
+    Canonicalize without breaking sites that REQUIRE query params (e.g. Revize `t=`).
+    - Normalize path encoding (avoid double-encoding)
+    - Preserve query params (including `t=...`)
+    - Optionally de-dupe ONLY truly safe tracking params (utm_*)
+    """
     parts = urlsplit(u)
 
-    # Fix double encoding
-    decoded_path = unquote(parts.path)
-    safe_path = quote(decoded_path, safe="/%")
+    # Normalize path safely (avoid double-encoding like %2520)
+    raw_path = unquote(parts.path)
+    safe_path = quote(raw_path, safe="/")
 
-    # De-dupe query params by key
+    # Preserve query params (order + duplicates) — don't drop `t=`
     qs = parse_qsl(parts.query, keep_blank_values=True)
-    kv = {}
-    for k, v in qs:
-        kv[k] = v
 
-    # Drop cachebusters
-    kv.pop("t", None)
-    kv.pop("_", None)
+    # Optional: remove only common marketing params (safe to drop)
+    qs = [(k, v) for (k, v) in qs if not k.lower().startswith("utm_")]
 
-    # ✅ FIX HERE
-    new_query = urlencode(kv, doseq=False)
+    new_query = urlencode(qs, doseq=True)
 
     return urlunsplit((parts.scheme, parts.netloc, safe_path, new_query, parts.fragment))
-    
+
+
 def normalize_url(u: str) -> str:
-    # alias for older name
     return canonicalize_url(u)
 
 def fetch_html(url: str) -> str:
