@@ -60,7 +60,7 @@ TARGET_SITES = [
     {"town": "Westampton", "url": "https://www.westamptonnj.gov/node/32/agenda"},
     {"town": "Pemberton Township", "url": "https://www.pemberton-twp.com/government/minutes_ordinances/current_year_meeting_minutes.php"},
     {"town": "Shamong", "url": "https://www.shamong.net/community_county_burlington/meetingsagendasminutes/joint_land_use_board_jlub.php#outer-764sub-771"},
-    {"town": "Tabernackle", "url": "https://www.townshipoftabernacle-nj.gov/departments/land_development_board/meeting_minutes.php"},
+    {"town": "Tabernacle", "url": "https://www.tabernacle-nj.gov/departments/land_development_board/meeting_minutes.php"},
     {"town": "Swedesboro", "url": "https://ecode360.com/SW0669/documents/Minutes#category-89893453"},
     {"town": "Swedesboro", "url": "https://ecode360.com/SW0669/documents/Agendas#category-89874773"},
 ]
@@ -198,6 +198,75 @@ def canonicalize_url(u: str) -> str:
 
 def normalize_url(u: str) -> str:
     return canonicalize_url(u)
+
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, unquote, quote
+
+# If you know a site's Revize "slug", you can hardcode it here.
+# (You already discovered Washington Township's slug: washingtontownshipnj)
+REVIZE_KNOWN_SLUGS = {
+    "www.twp.washington.nj.us": "washingtontownshipnj",
+    "twp.washington.nj.us": "washingtontownshipnj",
+    # If you discover others later, add them here.
+    # "www.shamong.net": "<slug>",
+}
+
+REVIZE_CMS_HOSTS = [
+    "cms2.revize.com",
+    "webgen1.revize.com",
+    "cms.revize.com",
+]
+
+def _basename(path: str) -> str:
+    path = path.rstrip("/")
+    return path.split("/")[-1] if path else ""
+
+def build_revize_fallbacks(original_url: str) -> list[str]:
+    """
+    If a 'pretty' town URL 404s, try known Revize CMS locations.
+    Works for URLs that end with .pdf (your Washington Township case).
+    """
+    parts = urlsplit(original_url)
+    fname = _basename(parts.path)
+    if not fname.lower().endswith(".pdf"):
+        return []
+
+    slug = REVIZE_KNOWN_SLUGS.get(parts.netloc)
+    if not slug:
+        return []
+
+    # Preserve query string (including duplicate keys like t=...&t=...)
+    # NOTE: parse_qsl preserves duplicates if keep_blank_values=True
+    qs = parse_qsl(parts.query, keep_blank_values=True)
+    new_query = urlencode(qs, doseq=True)
+
+    # Use an encoded filename but avoid double-encoding
+    safe_fname = quote(unquote(fname))
+
+    fallbacks = []
+    for cms_host in REVIZE_CMS_HOSTS:
+        fallbacks.append(
+            urlunsplit(
+                (parts.scheme or "https", cms_host, f"/revize/{slug}/{safe_fname}", new_query, "")
+            )
+        )
+
+    # Also try without query (some servers dislike it)
+    for cms_host in REVIZE_CMS_HOSTS:
+        fallbacks.append(
+            urlunsplit(
+                (parts.scheme or "https", cms_host, f"/revize/{slug}/{safe_fname}", "", "")
+            )
+        )
+
+    # De-dupe while keeping order
+    out = []
+    seen = set()
+    for u in fallbacks:
+        u = canonicalize_url(u)
+        if u not in seen:
+            out.append(u)
+            seen.add(u)
+    return out
 
 def fetch_html(url: str) -> str:
     """
@@ -467,36 +536,41 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
 
     last_err = None
 
+    # --- base candidates ---
     candidates = [url]
     parts = urlsplit(url)
 
-    # Candidate: strip query
+    # try without query
     no_query = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
     if no_query != url:
         candidates.append(no_query)
 
-    # Candidate: add www
+    # try with/without www
     if parts.netloc and not parts.netloc.startswith("www."):
         www = urlunsplit((parts.scheme, "www." + parts.netloc, parts.path, parts.query, parts.fragment))
         candidates.append(canonicalize_url(www))
+    elif parts.netloc.startswith("www."):
+        bare = urlunsplit((parts.scheme, parts.netloc[4:], parts.path, parts.query, parts.fragment))
+        candidates.append(canonicalize_url(bare))
 
-    # Candidate: duplicate t=... if present once (some Revize links behave oddly)
-    qs = parse_qsl(parts.query, keep_blank_values=True)
-    t_vals = [v for (k, v) in qs if k.lower() == "t"]
-    if len(t_vals) == 1:
-        qs2 = qs + [("t", t_vals[0])]
-        dup_t = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(qs2, doseq=True), parts.fragment))
-        candidates.append(canonicalize_url(dup_t))
+    # de-dupe
+    _c = []
+    _seen = set()
+    for c in candidates:
+        c = canonicalize_url(c)
+        if c not in _seen:
+            _c.append(c)
+            _seen.add(c)
+    candidates = _c
 
-    candidates = _dedupe_keep_order(candidates)
+    def try_candidates(cands: list[str]) -> tuple[Optional[pathlib.Path], bool]:
+        """
+        Returns (path if downloaded, saw_non_404 flag)
+        """
+        nonlocal last_err
 
-    # We only want to do the "scrape referer for alternates" once
-    alternates_added = False
-
-    for attempt in range(1, 4):
         saw_non_404 = False
-
-        for cand in list(candidates):
+        for cand in cands:
             try:
                 headers = {}
                 if referer:
@@ -512,41 +586,44 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
                 )
 
                 if r.status_code == 404:
-                    # If we got a 404 and we have a referer page, try to find the real PDF URL there
-                    if referer and not alternates_added:
-                        alts = find_alternate_pdf_urls(original_pdf_url=url, referer_url=referer)
-                        if alts:
-                            candidates.extend(alts)
-                            candidates[:] = _dedupe_keep_order(candidates)
-                        alternates_added = True
                     continue
 
                 saw_non_404 = True
                 r.raise_for_status()
 
-                first = r.raw.read(5, decode_content=True)
-                content = first + r.content
+                # robust content read
+                content = r.content
 
                 ctype = (r.headers.get("Content-Type") or "").lower()
                 if "pdf" not in ctype and not content.startswith(b"%PDF"):
                     raise RuntimeError(f"Response did not look like a PDF (content-type={ctype})")
 
                 path.write_bytes(content)
-                return path
+                return path, saw_non_404
 
             except Exception as e:
                 last_err = e
 
-        # If we tried everything and ONLY got 404s, stop retrying
+        return None, saw_non_404
+
+    for attempt in range(1, 4):
+        downloaded, saw_non_404 = try_candidates(candidates)
+        if downloaded:
+            return downloaded
+
+        # If *everything* was 404, try Revize fallbacks (Washington Twp fix)
         if not saw_non_404:
-            raise RuntimeError("All download candidates returned 404 Not Found")
+            revize_fallbacks = build_revize_fallbacks(url)
+            if revize_fallbacks:
+                downloaded2, saw_non_404_2 = try_candidates(revize_fallbacks)
+                if downloaded2:
+                    return downloaded2
 
         time.sleep(2 * attempt)
 
-    if last_err is None:
-        raise RuntimeError("All download candidates returned 404 Not Found")
-
-    raise RuntimeError(f"Failed to download PDF after retries: {last_err}")
+    # Final failure
+    msg = str(last_err) if last_err else "Unknown download_pdf error"
+    raise RuntimeError(msg)
 
 def extract_text(pdf_path: pathlib.Path) -> str:
     parts: list[str] = []
