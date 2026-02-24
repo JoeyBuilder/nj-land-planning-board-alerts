@@ -11,8 +11,12 @@ from bs4 import BeautifulSoup
 
 import time
 import warnings
+import logging
+
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+logging.getLogger("pdfminer").setLevel(logging.ERROR)  # silence FontBBox/pdfminer noise
 
 # =========================
 # CONFIG — EDIT THESE
@@ -61,10 +65,8 @@ TARGET_SITES = [
     {"town": "Swedesboro", "url": "https://ecode360.com/SW0669/documents/Agendas#category-89874773"},
 ]
 
-# If the site uses relative links, we’ll join them against the page URL.
 USER_AGENT = "Mozilla/5.0 (GitHubActions PlanningBoard Monitor)"
 
-# Keywords tuned for agendas/minutes like your Dec 11, 2025 Winslow PB agenda
 KEYWORDS = [
     "minor subdivision",
     "major subdivision",
@@ -77,10 +79,23 @@ KEYWORDS = [
     "memorialization",
 ]
 
-# NJ-style parcel pattern: Block ####(.## optional) + Lot/Lots ...
 BLOCK_LOT_REGEX = re.compile(
     r"\bBlock\s*\d+(?:\.\d+)?\b[\s\S]{0,120}?\bLot(?:s)?\s*[\d][\d,\s&\-\.\(\)]*",
     re.IGNORECASE,
+)
+
+# Filter links so we don't chase irrelevant PDFs
+LINK_HINTS = (
+    "agenda",
+    "minutes",
+    "planning",
+    "zoning",
+    "board",
+    "land use",
+    "land development",
+    "jlu",
+    "jlub",
+    "joint land use",
 )
 
 # Where we store downloaded PDFs + the “seen links” list
@@ -88,9 +103,8 @@ DATA_DIR = pathlib.Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen_links.json"
 
-# GitHub issue creation settings
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # provided automatically by Actions
-REPO = os.getenv("GITHUB_REPOSITORY")     # e.g. "username/repo"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+REPO = os.getenv("GITHUB_REPOSITORY")
 
 
 # =========================
@@ -114,23 +128,34 @@ def sha1(s: str) -> str:
 
 
 SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-})
+SESSION.headers.update(
+    {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+)
+
 
 def fetch_html(url: str) -> str:
-    r = SESSION.get(url, timeout=40, allow_redirects=True, verify=False)
-    r.raise_for_status()
-    return r.text
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            r = SESSION.get(url, timeout=40, allow_redirects=True, verify=False)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * attempt)
+    raise RuntimeError(last_err)
 
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 def normalize_url(u: str) -> str:
     parts = urlsplit(u)
-    # De-dupe query params (you had cases with ?t=...&t=...)
     qs = parse_qsl(parts.query, keep_blank_values=True)
     seen = set()
     qs2 = []
@@ -142,11 +167,66 @@ def normalize_url(u: str) -> str:
     new_query = urlencode(qs2)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
-def extract_pdf_links(html: str, base_url: str) -> list[str]:
+
+def looks_like_board_doc(a_tag) -> bool:
+    txt = " ".join(a_tag.stripped_strings).lower()
+    if any(h in txt for h in LINK_HINTS):
+        return True
+    for attr in ("title", "aria-label"):
+        v = (a_tag.get(attr) or "").lower()
+        if any(h in v for h in LINK_HINTS):
+            return True
+    return False
+
+
+def extract_agendacenter_links(html: str, base_url: str) -> list[str]:
+    """
+    CivicPlus AgendaCenter pages often use /AgendaCenter/ViewFile/<Type>/<id> links
+    that do NOT end in .pdf, but usually return PDFs.
+    """
     soup = BeautifulSoup(html, "html.parser")
-    links = []
+    links: list[str] = []
 
     for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        full = requests.compat.urljoin(base_url, href)
+        full = normalize_url(full)
+        low = full.lower()
+
+        # Core AgendaCenter file endpoint patterns
+        if "/agendacenter/viewfile/" in low:
+            # Prefer agendas/minutes/packets; skip random viewfile types if any
+            if any(seg in low for seg in ("/agenda/", "/minutes/", "/packet/")):
+                links.append(full)
+                continue
+
+        # Some civicplus sites use "ViewFile" with query params or other casing
+        if "agendacenter" in low and "viewfile" in low and any(k in low for k in ("agenda", "minutes", "packet")):
+            links.append(full)
+
+    # de-dupe preserve order
+    out, seen = [], set()
+    for l in links:
+        if l not in seen:
+            out.append(l)
+            seen.add(l)
+    return out
+
+
+def extract_pdf_links(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links: list[str] = []
+
+    base_low = base_url.lower()
+    if "/agendacenter/" in base_low:
+        # add civicplus-specific file links
+        links.extend(extract_agendacenter_links(html, base_url))
+
+    for a in soup.find_all("a", href=True):
+        # Only chase links that look like agendas/minutes/boards
+        if not looks_like_board_doc(a):
+            continue
+
         href = a["href"].strip()
         full = requests.compat.urljoin(base_url, href)
         full = normalize_url(full)
@@ -159,10 +239,16 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
             links.append(full)
             continue
 
+        # Keep AgendaCenter ViewFile links even without .pdf
+        if "/agendacenter/viewfile/" in low and any(seg in low for seg in ("/agenda/", "/minutes/", "/packet/")):
+            links.append(full)
+            continue
+
         # Keep only true direct PDF URLs
         if path.endswith(".pdf"):
-            # Optional: skip Revize "Document Center/Department" paths (often 404/irrelevant)
-            if "document center" in path:
+            # Skip Revize "document center" variants (often irrelevant or 404)
+            doccenter_markers = ("documentcenter", "document_center", "document%20center", "document center")
+            if any(m in path for m in doccenter_markers):
                 continue
             links.append(full)
 
@@ -174,7 +260,8 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
             seen.add(l)
     return out
 
-def download_pdf(url: str) -> pathlib.Path:
+
+def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     pdf_name = f"{sha1(url)}.pdf"
     path = DATA_DIR / pdf_name
     if path.exists():
@@ -183,14 +270,29 @@ def download_pdf(url: str) -> pathlib.Path:
     last_err = None
     for attempt in range(1, 4):
         try:
-            r = SESSION.get(url, timeout=90, allow_redirects=True, verify=False)
+            headers = {}
+            if referer:
+                headers["Referer"] = referer
+
+            r = SESSION.get(
+                url,
+                timeout=90,
+                allow_redirects=True,
+                verify=False,
+                headers=headers,
+                stream=True,
+            )
             r.raise_for_status()
 
+            # read small chunk first, then full
+            first = r.raw.read(5, decode_content=True)
+            content = first + r.content
+
             ctype = (r.headers.get("Content-Type") or "").lower()
-            if "pdf" not in ctype and not r.content.startswith(b"%PDF"):
+            if "pdf" not in ctype and not content.startswith(b"%PDF"):
                 raise RuntimeError(f"Response did not look like a PDF (content-type={ctype})")
 
-            path.write_bytes(r.content)
+            path.write_bytes(content)
             return path
 
         except Exception as e:
@@ -198,6 +300,7 @@ def download_pdf(url: str) -> pathlib.Path:
             time.sleep(2 * attempt)
 
     raise RuntimeError(f"Failed to download PDF after retries: {last_err}")
+
 
 def extract_text(pdf_path: pathlib.Path) -> str:
     parts = []
@@ -210,19 +313,12 @@ def extract_text(pdf_path: pathlib.Path) -> str:
 
 
 def analyze_text(text: str) -> dict:
-    """
-    Returns analysis including:
-    - keyword hits
-    - block/lot matches (snippets)
-    - relevant boolean
-    """
     lower = text.lower()
     keyword_hits = [k for k in KEYWORDS if k in lower]
 
     snippets = []
     for m in re.finditer(BLOCK_LOT_REGEX, text):
         snippet = m.group(0).replace("\n", " ").strip()
-        # keep it readable
         snippets.append(snippet[:240])
 
     relevant = bool(keyword_hits) and bool(snippets)
@@ -267,7 +363,7 @@ def main():
             continue
 
         pdf_links = extract_pdf_links(html, page_url)
-        pdf_links = pdf_links[:20]  # limit per site
+        pdf_links = pdf_links[:20]
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
         for pdf_url in pdf_links:
@@ -275,20 +371,22 @@ def main():
                 continue
 
             try:
-                pdf_path = download_pdf(pdf_url)
-                seen.add(pdf_url) # ✅ mark seen only after successful download
-                
+                pdf_path = download_pdf(pdf_url, referer=page_url)
+                seen.add(pdf_url)  # ✅ only after successful download
+
                 text = extract_text(pdf_path)
                 result = analyze_text(text)
 
                 if result["relevant"]:
-                    new_relevant_hits.append({
-                        "town": town,
-                        "source_page": page_url,
-                        "pdf_url": pdf_url,
-                        "keyword_hits": result["keyword_hits"],
-                        "block_lot_snippets": result["block_lot_snippets"],
-                    })
+                    new_relevant_hits.append(
+                        {
+                            "town": town,
+                            "source_page": page_url,
+                            "pdf_url": pdf_url,
+                            "keyword_hits": result["keyword_hits"],
+                            "block_lot_snippets": result["block_lot_snippets"],
+                        }
+                    )
 
             except Exception as e:
                 print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
@@ -320,6 +418,7 @@ def main():
 
     create_github_issue(title=title, body=body)
     print("[INFO] GitHub Issue created.")
+
 
 if __name__ == "__main__":
     main()
