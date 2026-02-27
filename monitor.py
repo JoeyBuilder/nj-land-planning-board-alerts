@@ -99,6 +99,50 @@ LINK_HINTS = (
     "joint land use",
 )
 
+# =========================
+# NEW: Residential vs Commercial filtering
+# =========================
+RESIDENTIAL_USE_KEYWORDS = [
+    "residential", "single family", "single-family", "sf", "sfd",
+    "townhouse", "town home", "multifamily", "multi-family",
+    "duplex", "triplex", "quad", "apartments", "apartment",
+    "condominium", "condo", "age-restricted", "55+", "senior housing",
+    "cluster", "residential subdivision", "minor subdivision", "major subdivision",
+    "creating", "new lot", "new lots", "building lot", "building lots",
+    "infill", "dwelling", "dwelling unit", "dwelling units",
+]
+
+RESIDENTIAL_ZONE_HINTS = [
+    "r-1", "r-2", "r-3", "r-4", "r-5", "rr", "res",
+    "rm", "rh", "mf", "mfr", "prd", "pud", "cluster",
+]
+
+COMMERCIAL_USE_KEYWORDS = [
+    "commercial", "retail", "shopping", "store", "tenant", "lease", "leased",
+    "restaurant", "diner", "drive-thru", "drive thru", "fast food",
+    "wawa", "7-eleven", "dunkin", "starbucks",
+    "office", "medical office", "clinic", "urgent care", "bank",
+    "warehouse", "distribution", "logistics", "industrial", "manufacturing",
+    "self storage", "self-storage", "storage facility",
+    "hotel", "motel", "gas station", "fuel", "convenience store",
+    "auto", "dealership", "car wash", "oil change",
+    "sign", "signage", "freestanding sign",
+    "site plan",  # often commercial, but helps suppress noise
+]
+
+COMMERCIAL_ZONE_HINTS = [
+    "c-1", "c-2", "c-3", "c-4", "c1", "c2", "c3", "c4",
+    "hc", "highway commercial", "cc",
+    "i-1", "i-2", "i-3", "i1", "i2", "i3",
+    "li", "hi", "industrial", "ip", "bp", "business park",
+    "m-1", "m-2", "m1", "m2",
+]
+
+# Set to True if you want to allow "mixed" results too (res + com),
+# otherwise it will alert ONLY if classified "residential".
+ALLOW_MIXED_USE = False
+
+
 # Storage
 DATA_DIR = pathlib.Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -230,7 +274,7 @@ def fetch_html(url: str) -> str:
 
 
 # -------------------------
-# Revize helpers (NEW)
+# Revize helpers
 # -------------------------
 REVIZE_SLUG_CACHE: dict[str, str] = {}  # domain -> slug
 
@@ -343,17 +387,14 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
         low = full.lower()
         path = urlsplit(full).path.lower()
 
-        # Granicus agenda viewer links (not direct PDFs, but still useful)
         if "agendaviewer.php" in low:
             links.append(full)
             continue
 
-        # AgendaCenter ViewFile links (often PDF response even without .pdf)
         if "/agendacenter/viewfile/" in low and any(seg in low for seg in ("/agenda/", "/minutes/", "/packet/")):
             links.append(full)
             continue
 
-        # Direct PDFs only
         if path.endswith(".pdf"):
             doccenter_markers = ("documentcenter", "document_center", "document%20center", "document center")
             if any(m in path for m in doccenter_markers):
@@ -410,7 +451,6 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
         full = requests.compat.urljoin(viewer_url, src)
         add(full)
 
-    # De-dupe
     out: list[str] = []
     seen_local: set[str] = set()
     for u in found:
@@ -418,7 +458,6 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
             out.append(u)
             seen_local.add(u)
 
-    # Light filter (optional)
     filtered: list[str] = []
     for u in out:
         ulow = u.lower()
@@ -429,7 +468,7 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
 
 
 # -------------------------
-# Download PDF (UPDATED)
+# Download PDF
 # -------------------------
 def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     url = canonicalize_url(url)
@@ -442,12 +481,10 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     candidates = [url]
     parts = urlsplit(url)
 
-    # try without query
     no_query = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
     if no_query != url:
         candidates.append(no_query)
 
-    # try with/without www
     if parts.netloc and not parts.netloc.startswith("www."):
         www = urlunsplit((parts.scheme, "www." + parts.netloc, parts.path, parts.query, parts.fragment))
         candidates.append(canonicalize_url(www))
@@ -455,7 +492,6 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
         bare = urlunsplit((parts.scheme, parts.netloc[4:], parts.path, parts.query, parts.fragment))
         candidates.append(canonicalize_url(bare))
 
-    # De-dupe
     deduped = []
     seen_c = set()
     for c in candidates:
@@ -468,17 +504,12 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     last_err: Optional[Exception] = None
 
     def try_candidates(url_list: list[str]) -> tuple[Optional[pathlib.Path], bool]:
-        """
-        Returns (saved_path_or_none, saw_non_404)
-        """
         nonlocal last_err
 
         saw_non_404 = False
         for cand in url_list:
             try:
-                headers = {
-                    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
-                }
+                headers = {"Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8"}
                 if referer:
                     headers["Referer"] = referer
 
@@ -492,7 +523,6 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
                 )
 
                 if r.status_code == 404:
-                    # record something so we never end as "Unknown download_pdf error"
                     last_err = RuntimeError(f"404 Not Found: {cand}")
                     continue
 
@@ -513,26 +543,20 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
 
         return None, saw_non_404
 
-    # First attempt normal candidates
     saved, saw_non_404 = try_candidates(candidates)
     if saved:
         return saved
 
-    # If everything 404'd, try Revize rewrite (auto-discover slug)
     if not saw_non_404:
         slug = discover_revize_slug(referer or url)
         if slug:
             revize_url = build_revize_pdf_url(url, slug)
-            saved2, saw_non_404_2 = try_candidates([revize_url])
+            saved2, _ = try_candidates([revize_url])
             if saved2:
                 return saved2
 
-            if (not saw_non_404_2) and last_err is None:
-                last_err = RuntimeError("All download candidates returned 404 Not Found (including Revize rewrite)")
-
         raise RuntimeError(str(last_err) if last_err else "All download candidates returned 404 Not Found")
 
-    # Non-404 failures (403/timeout/bad content-type/etc)
     raise RuntimeError(f"Failed to download PDF: {last_err}" if last_err else "Failed to download PDF")
 
 
@@ -549,6 +573,39 @@ def extract_text(pdf_path: pathlib.Path) -> str:
     return "\n".join(parts)
 
 
+def classify_land_use(text: str) -> dict:
+    lower = text.lower()
+
+    res_hits = [k for k in RESIDENTIAL_USE_KEYWORDS if k in lower]
+    com_hits = [k for k in COMMERCIAL_USE_KEYWORDS if k in lower]
+
+    res_zone_hits = [z for z in RESIDENTIAL_ZONE_HINTS if z in lower]
+    com_zone_hits = [z for z in COMMERCIAL_ZONE_HINTS if z in lower]
+
+    # simple scoring
+    res_score = len(res_hits) * 2 + len(res_zone_hits)
+    com_score = len(com_hits) * 2 + len(com_zone_hits)
+
+    if res_score == 0 and com_score == 0:
+        label = "unknown"
+    elif res_score >= com_score + 2:
+        label = "residential"
+    elif com_score >= res_score + 2:
+        label = "commercial"
+    else:
+        label = "mixed"
+
+    return {
+        "land_use": label,
+        "res_score": res_score,
+        "com_score": com_score,
+        "res_hits": res_hits[:25],
+        "com_hits": com_hits[:25],
+        "res_zone_hits": res_zone_hits[:15],
+        "com_zone_hits": com_zone_hits[:15],
+    }
+
+
 def analyze_text(text: str) -> dict:
     lower = text.lower()
     keyword_hits = [k for k in KEYWORDS if k in lower]
@@ -558,12 +615,26 @@ def analyze_text(text: str) -> dict:
         snippet = m.group(0).replace("\n", " ").strip()
         snippets.append(snippet[:240])
 
-    relevant = bool(keyword_hits) and bool(snippets)
+    base_relevant = bool(keyword_hits) and bool(snippets)
+
+    use_info = classify_land_use(text)
+
+    if ALLOW_MIXED_USE:
+        use_ok = use_info["land_use"] in ("residential", "mixed")
+    else:
+        use_ok = use_info["land_use"] == "residential"
+
+    relevant = base_relevant and use_ok
 
     return {
         "relevant": relevant,
         "keyword_hits": keyword_hits[:15],
         "block_lot_snippets": snippets[:20],
+        "land_use": use_info["land_use"],
+        "res_score": use_info["res_score"],
+        "com_score": use_info["com_score"],
+        "res_hits": use_info["res_hits"],
+        "com_hits": use_info["com_hits"],
     }
 
 
@@ -611,7 +682,6 @@ def main():
                     if resolved:
                         candidate_pdfs = resolved
                     else:
-                        # Don't treat viewer as permanently dead if it just had no PDFs today
                         continue
                 except Exception as e:
                     print(f"[ERROR] Viewer resolve failed: {town} {link} -> {e}")
@@ -623,7 +693,7 @@ def main():
 
                 try:
                     pdf_path = download_pdf(pdf_url, referer=page_url)
-                    seen.add(pdf_url)  # only after successful download
+                    seen.add(pdf_url)
 
                     text = extract_text(pdf_path)
                     result = analyze_text(text)
@@ -636,17 +706,18 @@ def main():
                                 "pdf_url": pdf_url,
                                 "keyword_hits": result["keyword_hits"],
                                 "block_lot_snippets": result["block_lot_snippets"],
+                                "land_use": result.get("land_use"),
+                                "res_score": result.get("res_score"),
+                                "com_score": result.get("com_score"),
+                                "res_hits": result.get("res_hits") or [],
+                                "com_hits": result.get("com_hits") or [],
                             }
                         )
 
                 except Exception as e:
                     msg = str(e).lower()
-
-                    # Only mark dead on confirmed "all 404" failures
                     if "all download candidates returned 404" in msg or msg.startswith("404 not found"):
                         failed.add(pdf_url)
-
-                    # Still log, but you won’t keep retrying true dead links forever
                     print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
 
     save_seen(seen)
@@ -656,12 +727,20 @@ def main():
         print("[INFO] No new relevant subdivision docs.")
         return
 
-    lines = ["New subdivision-related document(s) detected.\n"]
+    lines = ["New subdivision-related residential document(s) detected.\n"]
 
     for hit in new_relevant_hits:
         lines.append(f"**Town:** {hit['town']}")
         lines.append(f"**Source page:** {hit['source_page']}")
         lines.append(f"**PDF:** {hit['pdf_url']}")
+
+        # NEW: land-use visibility
+        lines.append(f"**Land use:** {hit.get('land_use')} (res={hit.get('res_score')}, com={hit.get('com_score')})")
+        if hit.get("res_hits"):
+            lines.append(f"**Residential signals:** {', '.join(hit['res_hits'][:8])}")
+        if hit.get("com_hits"):
+            lines.append(f"**Commercial signals:** {', '.join(hit['com_hits'][:8])}")
+
         if hit["keyword_hits"]:
             lines.append(f"**Keywords:** {', '.join(hit['keyword_hits'])}")
         if hit["block_lot_snippets"]:
@@ -672,7 +751,7 @@ def main():
 
     body = "\n".join(lines)
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    title = f"Subdivision Alert ({today}): {len(new_relevant_hits)} new document(s)"
+    title = f"Residential Subdivision Alert ({today}): {len(new_relevant_hits)} new document(s)"
 
     create_github_issue(title=title, body=body)
     print("[INFO] GitHub Issue created.")
