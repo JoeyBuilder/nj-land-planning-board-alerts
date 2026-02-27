@@ -79,13 +79,11 @@ KEYWORDS = [
     "memorialization",
 ]
 
-# NJ-style parcel pattern: Block ####(.## optional) + Lot/Lots ...
 BLOCK_LOT_REGEX = re.compile(
     r"\bBlock\s*\d+(?:\.\d+)?\b[\s\S]{0,120}?\bLot(?:s)?\s*[\d][\d,\s&\-\.\(\)]*",
     re.IGNORECASE,
 )
 
-# Filter links so we don't chase irrelevant PDFs
 LINK_HINTS = (
     "agenda",
     "minutes",
@@ -100,7 +98,7 @@ LINK_HINTS = (
 )
 
 # =========================
-# NEW: Residential vs Commercial filtering
+# Residential-only filter
 # =========================
 RESIDENTIAL_USE_KEYWORDS = [
     "residential", "single family", "single-family", "sf", "sfd",
@@ -127,7 +125,7 @@ COMMERCIAL_USE_KEYWORDS = [
     "hotel", "motel", "gas station", "fuel", "convenience store",
     "auto", "dealership", "car wash", "oil change",
     "sign", "signage", "freestanding sign",
-    "site plan",  # often commercial, but helps suppress noise
+    "site plan",
 ]
 
 COMMERCIAL_ZONE_HINTS = [
@@ -138,9 +136,29 @@ COMMERCIAL_ZONE_HINTS = [
     "m-1", "m-2", "m1", "m2",
 ]
 
-# Set to True if you want to allow "mixed" results too (res + com),
-# otherwise it will alert ONLY if classified "residential".
-ALLOW_MIXED_USE = False
+ALLOW_MIXED_USE = False  # keep residential-only by default
+
+# =========================
+# Applicant extraction (NEW)
+# =========================
+# This is heuristic: agendas/resolutions vary, so we try multiple patterns.
+APPLICANT_PATTERNS: list[re.Pattern] = [
+    # Applicant: John Doe / Applicant - John Doe
+    re.compile(r"\bApplicant\s*[:\-]\s*(?P<name>[A-Z][A-Za-z0-9&.,'’\-\s]{2,80})", re.IGNORECASE),
+    # Applicant/Owner: ...
+    re.compile(r"\bApplicant\s*/\s*Owner\s*[:\-]\s*(?P<name>[A-Z][A-Za-z0-9&.,'’\-\s]{2,80})", re.IGNORECASE),
+    # Owner: ...
+    re.compile(r"\bOwner\s*[:\-]\s*(?P<name>[A-Z][A-Za-z0-9&.,'’\-\s]{2,80})", re.IGNORECASE),
+    # Developer: ...
+    re.compile(r"\bDeveloper\s*[:\-]\s*(?P<name>[A-Z][A-Za-z0-9&.,'’\-\s]{2,80})", re.IGNORECASE),
+    # Applicant is XYZ / Applicant(s) are XYZ
+    re.compile(r"\bApplicant(?:s)?\s+(?:is|are)\s+(?P<name>[A-Z][A-Za-z0-9&.,'’\-\s]{2,80})", re.IGNORECASE),
+    # "ABC LLC" (Applicant) - in parentheses
+    re.compile(r"(?P<name>[A-Z][A-Za-z0-9&.,'’\-\s]{2,80})\s*\(\s*Applicant\s*\)", re.IGNORECASE),
+]
+
+# common suffixes to keep; we also trim trailing junk.
+_APPLICANT_CLEAN_RE = re.compile(r"[\s,;:\-]+$")
 
 
 # Storage
@@ -149,7 +167,6 @@ DATA_DIR.mkdir(exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen_links.json"
 FAILED_FILE = DATA_DIR / "dead_links.json"
 
-# GitHub issue creation settings
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
 
@@ -190,6 +207,20 @@ def sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
+def canonicalize_url(u: str) -> str:
+    parts = urlsplit(u)
+    raw_path = unquote(parts.path)
+    safe_path = quote(raw_path, safe="/")
+    qs = parse_qsl(parts.query, keep_blank_values=True)
+    qs = [(k, v) for (k, v) in qs if not k.lower().startswith("utm_")]
+    new_query = urlencode(qs, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, safe_path, new_query, parts.fragment))
+
+
+def normalize_url(u: str) -> str:
+    return canonicalize_url(u)
+
+
 SESSION = requests.Session()
 SESSION.headers.update(
     {
@@ -204,36 +235,7 @@ SESSION.headers.update(
 )
 
 
-def canonicalize_url(u: str) -> str:
-    """
-    Canonicalize without breaking sites that REQUIRE query params (e.g. Revize `t=`).
-    - Normalize path encoding (avoid double-encoding)
-    - Preserve query params (including `t=...`)
-    - Optionally de-dupe ONLY truly safe tracking params (utm_*)
-    """
-    parts = urlsplit(u)
-
-    raw_path = unquote(parts.path)
-    safe_path = quote(raw_path, safe="/")
-
-    qs = parse_qsl(parts.query, keep_blank_values=True)
-    qs = [(k, v) for (k, v) in qs if not k.lower().startswith("utm_")]
-    new_query = urlencode(qs, doseq=True)
-
-    return urlunsplit((parts.scheme, parts.netloc, safe_path, new_query, parts.fragment))
-
-
-def normalize_url(u: str) -> str:
-    return canonicalize_url(u)
-
-
 def fetch_html(url: str) -> str:
-    """
-    Fetch HTML with:
-    - retry
-    - fallback to r.jina.ai proxy when basic bot blocks occur (403/406/429)
-    - DNS fallback: retry without leading www.
-    """
     last_err: Optional[Exception] = None
 
     def via_jina(u: str) -> str:
@@ -276,15 +278,10 @@ def fetch_html(url: str) -> str:
 # -------------------------
 # Revize helpers
 # -------------------------
-REVIZE_SLUG_CACHE: dict[str, str] = {}  # domain -> slug
+REVIZE_SLUG_CACHE: dict[str, str] = {}
 
 
 def discover_revize_slug(site_url: str) -> Optional[str]:
-    """
-    Find a Revize slug by looking for:
-      https://cms2.revize.com/revize/<slug>/
-    Cache per domain.
-    """
     try:
         domain = urlsplit(site_url).netloc.lower()
         if domain.startswith("www."):
@@ -293,12 +290,7 @@ def discover_revize_slug(site_url: str) -> Optional[str]:
         if domain in REVIZE_SLUG_CACHE:
             return REVIZE_SLUG_CACHE[domain]
 
-        candidates = [
-            site_url,
-            f"https://{domain}/",
-            f"https://www.{domain}/",
-        ]
-
+        candidates = [site_url, f"https://{domain}/", f"https://www.{domain}/"]
         slug_re = re.compile(r"cms2\.revize\.com/revize/([A-Za-z0-9_\-]+)/", re.IGNORECASE)
 
         for u in candidates:
@@ -319,10 +311,6 @@ def discover_revize_slug(site_url: str) -> Optional[str]:
 
 
 def build_revize_pdf_url(original_pdf_url: str, slug: str) -> str:
-    """
-    Rewrite pretty town pdf URL to Revize CMS:
-      https://cms2.revize.com/revize/<slug>/<filename>.pdf?...query...
-    """
     parts = urlsplit(original_pdf_url)
     filename = parts.path.split("/")[-1] or "document.pdf"
     return urlunsplit(("https", "cms2.revize.com", f"/revize/{slug}/{filename}", parts.query, ""))
@@ -573,6 +561,38 @@ def extract_text(pdf_path: pathlib.Path) -> str:
     return "\n".join(parts)
 
 
+def extract_applicant_names(text: str) -> list[str]:
+    """
+    Heuristic extraction: try several patterns. Returns unique names in order found.
+    """
+    names: list[str] = []
+    lower = text.lower()
+
+    # keep searches in first N chars for agendas/minutes where applicant listed up top
+    # (still catches mid-doc items often, but reduces random matches)
+    window = text[:25000] if len(text) > 25000 else text
+
+    for pat in APPLICANT_PATTERNS:
+        for m in pat.finditer(window):
+            raw = (m.group("name") or "").strip()
+            raw = _APPLICANT_CLEAN_RE.sub("", raw)
+            # avoid obviously-bad captures
+            if not raw or len(raw) < 3:
+                continue
+            # cut off at line breaks / double spaces / "Block" etc.
+            raw = re.split(r"\n|  +|\bBlock\b|\bLot\b|\bResolution\b", raw, maxsplit=1)[0].strip()
+            # normalize spacing
+            raw = re.sub(r"\s{2,}", " ", raw).strip()
+
+            # reject generic words
+            if raw.lower() in ("n/a", "na", "none", "tbd"):
+                continue
+            if raw and raw not in names:
+                names.append(raw)
+
+    return names[:5]  # keep alert small
+
+
 def classify_land_use(text: str) -> dict:
     lower = text.lower()
 
@@ -582,7 +602,6 @@ def classify_land_use(text: str) -> dict:
     res_zone_hits = [z for z in RESIDENTIAL_ZONE_HINTS if z in lower]
     com_zone_hits = [z for z in COMMERCIAL_ZONE_HINTS if z in lower]
 
-    # simple scoring
     res_score = len(res_hits) * 2 + len(res_zone_hits)
     com_score = len(com_hits) * 2 + len(com_zone_hits)
 
@@ -601,8 +620,6 @@ def classify_land_use(text: str) -> dict:
         "com_score": com_score,
         "res_hits": res_hits[:25],
         "com_hits": com_hits[:25],
-        "res_zone_hits": res_zone_hits[:15],
-        "com_zone_hits": com_zone_hits[:15],
     }
 
 
@@ -618,11 +635,12 @@ def analyze_text(text: str) -> dict:
     base_relevant = bool(keyword_hits) and bool(snippets)
 
     use_info = classify_land_use(text)
-
     if ALLOW_MIXED_USE:
         use_ok = use_info["land_use"] in ("residential", "mixed")
     else:
         use_ok = use_info["land_use"] == "residential"
+
+    applicants = extract_applicant_names(text)
 
     relevant = base_relevant and use_ok
 
@@ -632,9 +650,9 @@ def analyze_text(text: str) -> dict:
         "block_lot_snippets": snippets[:20],
         "land_use": use_info["land_use"],
         "res_score": use_info["res_score"],
+        # keep com_score internally (used for classification), but you won't print signals anymore
         "com_score": use_info["com_score"],
-        "res_hits": use_info["res_hits"],
-        "com_hits": use_info["com_hits"],
+        "applicants": applicants,
     }
 
 
@@ -708,9 +726,7 @@ def main():
                                 "block_lot_snippets": result["block_lot_snippets"],
                                 "land_use": result.get("land_use"),
                                 "res_score": result.get("res_score"),
-                                "com_score": result.get("com_score"),
-                                "res_hits": result.get("res_hits") or [],
-                                "com_hits": result.get("com_hits") or [],
+                                "applicants": result.get("applicants") or [],
                             }
                         )
 
@@ -727,19 +743,21 @@ def main():
         print("[INFO] No new relevant subdivision docs.")
         return
 
-    lines = ["New subdivision-related residential document(s) detected.\n"]
+    lines = ["New residential subdivision-related document(s) detected.\n"]
 
     for hit in new_relevant_hits:
         lines.append(f"**Town:** {hit['town']}")
         lines.append(f"**Source page:** {hit['source_page']}")
         lines.append(f"**PDF:** {hit['pdf_url']}")
 
-        # NEW: land-use visibility
-        lines.append(f"**Land use:** {hit.get('land_use')} (res={hit.get('res_score')}, com={hit.get('com_score')})")
-        if hit.get("res_hits"):
-            lines.append(f"**Residential signals:** {', '.join(hit['res_hits'][:8])}")
-        if hit.get("com_hits"):
-            lines.append(f"**Commercial signals:** {', '.join(hit['com_hits'][:8])}")
+        # ✅ show applicant name(s)
+        if hit.get("applicants"):
+            lines.append(f"**Applicant/Owner:** {', '.join(hit['applicants'])}")
+        else:
+            lines.append("**Applicant/Owner:** (not found)")
+
+        # ✅ keep only residential classification summary (no commercial signals)
+        lines.append(f"**Land use:** {hit.get('land_use')} (res-score={hit.get('res_score')})")
 
         if hit["keyword_hits"]:
             lines.append(f"**Keywords:** {', '.join(hit['keyword_hits'])}")
