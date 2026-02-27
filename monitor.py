@@ -105,17 +105,6 @@ DATA_DIR.mkdir(exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen_links.json"
 FAILED_FILE = DATA_DIR / "dead_links.json"
 
-def load_failed() -> set[str]:
-    if FAILED_FILE.exists():
-        try:
-            return set(json.loads(FAILED_FILE.read_text(encoding="utf-8")))
-        except Exception:
-            return set()
-    return set()
-
-def save_failed(failed: set[str]) -> None:
-    FAILED_FILE.write_text(json.dumps(sorted(failed), indent=2), encoding="utf-8")
-
 # GitHub issue creation settings
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
@@ -170,7 +159,6 @@ SESSION.headers.update(
     }
 )
 
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, unquote, quote
 
 def canonicalize_url(u: str) -> str:
     """
@@ -181,16 +169,11 @@ def canonicalize_url(u: str) -> str:
     """
     parts = urlsplit(u)
 
-    # Normalize path safely (avoid double-encoding like %2520)
     raw_path = unquote(parts.path)
     safe_path = quote(raw_path, safe="/")
 
-    # Preserve query params (order + duplicates) — don't drop `t=`
     qs = parse_qsl(parts.query, keep_blank_values=True)
-
-    # Optional: remove only common marketing params (safe to drop)
     qs = [(k, v) for (k, v) in qs if not k.lower().startswith("utm_")]
-
     new_query = urlencode(qs, doseq=True)
 
     return urlunsplit((parts.scheme, parts.netloc, safe_path, new_query, parts.fragment))
@@ -199,74 +182,6 @@ def canonicalize_url(u: str) -> str:
 def normalize_url(u: str) -> str:
     return canonicalize_url(u)
 
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, unquote, quote
-
-# If you know a site's Revize "slug", you can hardcode it here.
-# (You already discovered Washington Township's slug: washingtontownshipnj)
-REVIZE_KNOWN_SLUGS = {
-    "www.twp.washington.nj.us": "washingtontownshipnj",
-    "twp.washington.nj.us": "washingtontownshipnj",
-    # If you discover others later, add them here.
-    # "www.shamong.net": "<slug>",
-}
-
-REVIZE_CMS_HOSTS = [
-    "cms2.revize.com",
-    "webgen1.revize.com",
-    "cms.revize.com",
-]
-
-def _basename(path: str) -> str:
-    path = path.rstrip("/")
-    return path.split("/")[-1] if path else ""
-
-def build_revize_fallbacks(original_url: str) -> list[str]:
-    """
-    If a 'pretty' town URL 404s, try known Revize CMS locations.
-    Works for URLs that end with .pdf (your Washington Township case).
-    """
-    parts = urlsplit(original_url)
-    fname = _basename(parts.path)
-    if not fname.lower().endswith(".pdf"):
-        return []
-
-    slug = REVIZE_KNOWN_SLUGS.get(parts.netloc)
-    if not slug:
-        return []
-
-    # Preserve query string (including duplicate keys like t=...&t=...)
-    # NOTE: parse_qsl preserves duplicates if keep_blank_values=True
-    qs = parse_qsl(parts.query, keep_blank_values=True)
-    new_query = urlencode(qs, doseq=True)
-
-    # Use an encoded filename but avoid double-encoding
-    safe_fname = quote(unquote(fname))
-
-    fallbacks = []
-    for cms_host in REVIZE_CMS_HOSTS:
-        fallbacks.append(
-            urlunsplit(
-                (parts.scheme or "https", cms_host, f"/revize/{slug}/{safe_fname}", new_query, "")
-            )
-        )
-
-    # Also try without query (some servers dislike it)
-    for cms_host in REVIZE_CMS_HOSTS:
-        fallbacks.append(
-            urlunsplit(
-                (parts.scheme or "https", cms_host, f"/revize/{slug}/{safe_fname}", "", "")
-            )
-        )
-
-    # De-dupe while keeping order
-    out = []
-    seen = set()
-    for u in fallbacks:
-        u = canonicalize_url(u)
-        if u not in seen:
-            out.append(u)
-            seen.add(u)
-    return out
 
 def fetch_html(url: str) -> str:
     """
@@ -278,7 +193,6 @@ def fetch_html(url: str) -> str:
     last_err: Optional[Exception] = None
 
     def via_jina(u: str) -> str:
-        # jina requires full URL (http/https)
         r = SESSION.get(f"https://r.jina.ai/{u}", timeout=60, allow_redirects=True, verify=False)
         r.raise_for_status()
         return r.text
@@ -315,6 +229,64 @@ def fetch_html(url: str) -> str:
     raise RuntimeError(str(last_err) if last_err else "Unknown fetch_html error")
 
 
+# -------------------------
+# Revize helpers (NEW)
+# -------------------------
+REVIZE_SLUG_CACHE: dict[str, str] = {}  # domain -> slug
+
+
+def discover_revize_slug(site_url: str) -> Optional[str]:
+    """
+    Find a Revize slug by looking for:
+      https://cms2.revize.com/revize/<slug>/
+    Cache per domain.
+    """
+    try:
+        domain = urlsplit(site_url).netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+
+        if domain in REVIZE_SLUG_CACHE:
+            return REVIZE_SLUG_CACHE[domain]
+
+        candidates = [
+            site_url,
+            f"https://{domain}/",
+            f"https://www.{domain}/",
+        ]
+
+        slug_re = re.compile(r"cms2\.revize\.com/revize/([A-Za-z0-9_\-]+)/", re.IGNORECASE)
+
+        for u in candidates:
+            try:
+                html = fetch_html(u)
+            except Exception:
+                continue
+
+            m = slug_re.search(html)
+            if m:
+                slug = m.group(1)
+                REVIZE_SLUG_CACHE[domain] = slug
+                return slug
+
+        return None
+    except Exception:
+        return None
+
+
+def build_revize_pdf_url(original_pdf_url: str, slug: str) -> str:
+    """
+    Rewrite pretty town pdf URL to Revize CMS:
+      https://cms2.revize.com/revize/<slug>/<filename>.pdf?...query...
+    """
+    parts = urlsplit(original_pdf_url)
+    filename = parts.path.split("/")[-1] or "document.pdf"
+    return urlunsplit(("https", "cms2.revize.com", f"/revize/{slug}/{filename}", parts.query, ""))
+
+
+# -------------------------
+# Link extraction helpers
+# -------------------------
 def looks_like_board_doc(a_tag) -> bool:
     txt = " ".join(a_tag.stripped_strings).lower()
     if any(h in txt for h in LINK_HINTS):
@@ -327,10 +299,6 @@ def looks_like_board_doc(a_tag) -> bool:
 
 
 def extract_agendacenter_links(html: str, base_url: str) -> list[str]:
-    """
-    CivicPlus AgendaCenter pages often use /AgendaCenter/ViewFile/<Type>/<id> links
-    that do NOT end in .pdf, but usually return PDFs.
-    """
     soup = BeautifulSoup(html, "html.parser")
     links: list[str] = []
 
@@ -387,7 +355,6 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
 
         # Direct PDFs only
         if path.endswith(".pdf"):
-            # Skip Revize "document center" variants (often irrelevant or 404)
             doccenter_markers = ("documentcenter", "document_center", "document%20center", "document center")
             if any(m in path for m in doccenter_markers):
                 continue
@@ -401,12 +368,8 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
             seen.add(l)
     return out
 
+
 def is_viewer_page(url: str) -> bool:
-    """
-    Detect pages that are likely HTML viewers (not direct PDFs).
-    We only treat these as viewer pages if they are NOT already a direct PDF
-    and NOT an AgendaCenter ViewFile endpoint.
-    """
     low = url.lower()
     path = urlsplit(url).path.lower()
 
@@ -415,18 +378,10 @@ def is_viewer_page(url: str) -> bool:
     if "/agendacenter/viewfile/" in low:
         return False
 
-    # common viewer patterns
-    return (
-        path.endswith(".php")
-        or "agendaviewer.php" in low
-        or "viewpublisher.php" in low
-    )
+    return (path.endswith(".php") or "agendaviewer.php" in low or "viewpublisher.php" in low)
+
 
 def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
-    """
-    Fetch an HTML viewer page (.php etc) and pull out real PDF links inside it.
-    Also captures AgendaCenter ViewFile links (which return PDFs even w/o .pdf).
-    """
     html = fetch_html(viewer_url)
     soup = BeautifulSoup(html, "html.parser")
 
@@ -434,16 +389,13 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
 
     def add(u: str) -> None:
         u = normalize_url(u)
-        # keep direct PDFs
         if urlsplit(u).path.lower().endswith(".pdf"):
             found.append(u)
             return
-        # keep civicplus viewfile endpoints
         low = u.lower()
         if "/agendacenter/viewfile/" in low and any(seg in low for seg in ("/agenda/", "/minutes/", "/packet/")):
             found.append(u)
 
-    # <a href="...">
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
         if not href:
@@ -451,7 +403,6 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
         full = requests.compat.urljoin(viewer_url, href)
         add(full)
 
-    # sometimes viewer embeds PDFs via iframe/embed src
     for tag in soup.find_all(["iframe", "embed"], src=True):
         src = (tag.get("src") or "").strip()
         if not src:
@@ -459,7 +410,7 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
         full = requests.compat.urljoin(viewer_url, src)
         add(full)
 
-    # De-dupe preserve order
+    # De-dupe
     out: list[str] = []
     seen_local: set[str] = set()
     for u in found:
@@ -467,7 +418,7 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
             out.append(u)
             seen_local.add(u)
 
-    # Optional: filter down to “board-ish” docs to avoid random PDFs
+    # Light filter (optional)
     filtered: list[str] = []
     for u in out:
         ulow = u.lower()
@@ -475,57 +426,11 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
             filtered.append(u)
 
     return filtered or out
-def _dedupe_keep_order(items: list[str]) -> list[str]:
-    out = []
-    seen = set()
-    for x in items:
-        if x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out
 
 
-def find_alternate_pdf_urls(original_pdf_url: str, referer_url: str) -> list[str]:
-    """
-    If a site returns 404 for a "pretty" PDF URL, try to discover the *real*
-    PDF link from the referer page HTML (Revize often hosts on cms*.revize.com).
-    Matches by filename (decoded) and also collects any Revize-hosted PDFs.
-    """
-    try:
-        html = fetch_html(referer_url)
-    except Exception:
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # filename match (decode so %20 and spaces match)
-    orig_path = urlsplit(original_pdf_url).path
-    orig_name = unquote(orig_path.split("/")[-1]).lower().strip()
-
-    candidates: list[str] = []
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        full = requests.compat.urljoin(referer_url, href)
-        full = normalize_url(full)
-
-        p = urlsplit(full).path.lower()
-        if not p.endswith(".pdf"):
-            continue
-
-        name = unquote(p.split("/")[-1]).lower().strip()
-
-        # Strong match: same filename
-        if orig_name and name == orig_name:
-            candidates.append(full)
-            continue
-
-        # Helpful extra: any Revize-hosted PDF (often the real storage host)
-        if "revize.com" in full.lower() or "cms" in urlsplit(full).netloc.lower():
-            candidates.append(full)
-
-    return _dedupe_keep_order(candidates)
-
+# -------------------------
+# Download PDF (UPDATED)
+# -------------------------
 def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     url = canonicalize_url(url)
 
@@ -534,9 +439,6 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     if path.exists():
         return path
 
-    last_err = None
-
-    # --- base candidates ---
     candidates = [url]
     parts = urlsplit(url)
 
@@ -553,26 +455,30 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
         bare = urlunsplit((parts.scheme, parts.netloc[4:], parts.path, parts.query, parts.fragment))
         candidates.append(canonicalize_url(bare))
 
-    # de-dupe
-    _c = []
-    _seen = set()
+    # De-dupe
+    deduped = []
+    seen_c = set()
     for c in candidates:
         c = canonicalize_url(c)
-        if c not in _seen:
-            _c.append(c)
-            _seen.add(c)
-    candidates = _c
+        if c not in seen_c:
+            deduped.append(c)
+            seen_c.add(c)
+    candidates = deduped
 
-    def try_candidates(cands: list[str]) -> tuple[Optional[pathlib.Path], bool]:
+    last_err: Optional[Exception] = None
+
+    def try_candidates(url_list: list[str]) -> tuple[Optional[pathlib.Path], bool]:
         """
-        Returns (path if downloaded, saw_non_404 flag)
+        Returns (saved_path_or_none, saw_non_404)
         """
         nonlocal last_err
 
         saw_non_404 = False
-        for cand in cands:
+        for cand in url_list:
             try:
-                headers = {}
+                headers = {
+                    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+                }
                 if referer:
                     headers["Referer"] = referer
 
@@ -586,16 +492,17 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
                 )
 
                 if r.status_code == 404:
+                    # record something so we never end as "Unknown download_pdf error"
+                    last_err = RuntimeError(f"404 Not Found: {cand}")
                     continue
 
                 saw_non_404 = True
                 r.raise_for_status()
 
-                # robust content read
                 content = r.content
-
                 ctype = (r.headers.get("Content-Type") or "").lower()
-                if "pdf" not in ctype and not content.startswith(b"%PDF"):
+
+                if ("pdf" not in ctype) and (not content.startswith(b"%PDF")):
                     raise RuntimeError(f"Response did not look like a PDF (content-type={ctype})")
 
                 path.write_bytes(content)
@@ -606,25 +513,32 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
 
         return None, saw_non_404
 
-    for attempt in range(1, 4):
-        downloaded, saw_non_404 = try_candidates(candidates)
-        if downloaded:
-            return downloaded
+    # First attempt normal candidates
+    saved, saw_non_404 = try_candidates(candidates)
+    if saved:
+        return saved
 
-        # If *everything* was 404, try Revize fallbacks (Washington Twp fix)
-        if not saw_non_404:
-            revize_fallbacks = build_revize_fallbacks(url)
-            if revize_fallbacks:
-                downloaded2, saw_non_404_2 = try_candidates(revize_fallbacks)
-                if downloaded2:
-                    return downloaded2
+    # If everything 404'd, try Revize rewrite (auto-discover slug)
+    if not saw_non_404:
+        slug = discover_revize_slug(referer or url)
+        if slug:
+            revize_url = build_revize_pdf_url(url, slug)
+            saved2, saw_non_404_2 = try_candidates([revize_url])
+            if saved2:
+                return saved2
 
-        time.sleep(2 * attempt)
+            if (not saw_non_404_2) and last_err is None:
+                last_err = RuntimeError("All download candidates returned 404 Not Found (including Revize rewrite)")
 
-    # Final failure
-    msg = str(last_err) if last_err else "Unknown download_pdf error"
-    raise RuntimeError(msg)
+        raise RuntimeError(str(last_err) if last_err else "All download candidates returned 404 Not Found")
 
+    # Non-404 failures (403/timeout/bad content-type/etc)
+    raise RuntimeError(f"Failed to download PDF: {last_err}" if last_err else "Failed to download PDF")
+
+
+# -------------------------
+# PDF parsing & analysis
+# -------------------------
 def extract_text(pdf_path: pathlib.Path) -> str:
     parts: list[str] = []
     with pdfplumber.open(str(pdf_path)) as pdf:
@@ -670,7 +584,7 @@ def create_github_issue(title: str, body: str) -> None:
 # =========================
 def main():
     seen = load_seen()
-    failed = load_failed()   # ✅ add
+    failed = load_failed()
     new_relevant_hits = []
 
     for site in TARGET_SITES:
@@ -683,17 +597,13 @@ def main():
             print(f"[ERROR] Fetch page failed: {town} {page_url} -> {e}")
             continue
 
-        pdf_links = extract_pdf_links(html, page_url)
-        pdf_links = pdf_links[:20]
+        pdf_links = extract_pdf_links(html, page_url)[:20]
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
         for link in pdf_links:
-            # ✅ skip anything we already processed OR already know is dead
             if link in seen or link in failed:
                 continue
 
-            # If this is a viewer page (.php / AgendaViewer.php / etc),
-            # resolve it to real PDF links first.
             candidate_pdfs = [link]
             if is_viewer_page(link):
                 try:
@@ -701,21 +611,19 @@ def main():
                     if resolved:
                         candidate_pdfs = resolved
                     else:
-                        # mark viewer as dead-ish so we don't keep hitting it
-                        failed.add(link)
+                        # Don't treat viewer as permanently dead if it just had no PDFs today
                         continue
                 except Exception as e:
                     print(f"[ERROR] Viewer resolve failed: {town} {link} -> {e}")
                     continue
 
-            # Process each PDF candidate (some viewer pages contain multiple PDFs)
             for pdf_url in candidate_pdfs:
                 if pdf_url in seen or pdf_url in failed:
                     continue
 
                 try:
                     pdf_path = download_pdf(pdf_url, referer=page_url)
-                    seen.add(pdf_url)  # ✅ only after successful download
+                    seen.add(pdf_url)  # only after successful download
 
                     text = extract_text(pdf_path)
                     result = analyze_text(text)
@@ -732,22 +640,23 @@ def main():
                         )
 
                 except Exception as e:
-                    # ✅ mark dead links so we don't retry them forever
                     msg = str(e).lower()
-                    if "404" in msg or "not found" in msg:
+
+                    # Only mark dead on confirmed "all 404" failures
+                    if "all download candidates returned 404" in msg or msg.startswith("404 not found"):
                         failed.add(pdf_url)
 
+                    # Still log, but you won’t keep retrying true dead links forever
                     print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
 
     save_seen(seen)
-    save_failed(failed)  # ✅ add
+    save_failed(failed)
 
     if not new_relevant_hits:
         print("[INFO] No new relevant subdivision docs.")
         return
 
-    lines = []
-    lines.append("New subdivision-related document(s) detected.\n")
+    lines = ["New subdivision-related document(s) detected.\n"]
 
     for hit in new_relevant_hits:
         lines.append(f"**Town:** {hit['town']}")
@@ -767,6 +676,7 @@ def main():
 
     create_github_issue(title=title, body=body)
     print("[INFO] GitHub Issue created.")
+
 
 if __name__ == "__main__":
     main()
