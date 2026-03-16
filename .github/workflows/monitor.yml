@@ -21,11 +21,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache state (seen links + downloaded PDFs)
-        uses: actions/cache@v4
+      - name: Restore state (seen links + doc fingerprints + downloaded PDFs)
+        uses: actions/restore@v4
         with:
           path: data
-          key: planning-board-monitor-state-v1
+          key: planning-board-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            planning-board-monitor-state-
 
       - name: Install dependencies
         run: |
@@ -37,3 +39,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python monitor.py
+
+      - name: Save state (seen links + doc fingerprints + downloaded PDFs)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: planning-board-monitor-state-${{ github.run_id }}
