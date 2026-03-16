@@ -165,6 +165,7 @@ _APPLICANT_CLEAN_RE = re.compile(r"[\s,;:\-]+$")
 DATA_DIR = pathlib.Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen_links.json"
+SEEN_DOCS_FILE = DATA_DIR / "seen_docs.json"
 FAILED_FILE = DATA_DIR / "dead_links.json"
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -194,6 +195,11 @@ def load_seen() -> set[str]:
 def save_seen(seen: set[str]) -> None:
     _save_set(SEEN_FILE, seen)
 
+def load_seen_docs() -> set[str]:
+    return _load_set(SEEN_DOCS_FILE)
+
+def save_seen_docs(seen_docs: set[str]) -> None:
+    _save_set(SEEN_DOCS_FILE, seen_docs)
 
 def load_failed() -> set[str]:
     return _load_set(FAILED_FILE)
@@ -219,6 +225,20 @@ def canonicalize_url(u: str) -> str:
 
 def normalize_url(u: str) -> str:
     return canonicalize_url(u)
+
+
+
+
+
+def normalize_text_for_fingerprint(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def build_doc_fingerprint(text: str, pdf_path: pathlib.Path) -> str:
+    normalized_text = normalize_text_for_fingerprint(text)
+    if normalized_text:
+        return f"text:{sha1(normalized_text)}"
+    return f"file:{hashlib.sha1(pdf_path.read_bytes()).hexdigest()}"
 
 
 SESSION = requests.Session()
@@ -673,6 +693,7 @@ def create_github_issue(title: str, body: str) -> None:
 # =========================
 def main():
     seen = load_seen()
+    seen_docs = load_seen_docs()
     failed = load_failed()
     new_relevant_hits = []
 
@@ -711,10 +732,14 @@ def main():
 
                 try:
                     pdf_path = download_pdf(pdf_url, referer=page_url)
-                    seen.add(pdf_url)
-
                     text = extract_text(pdf_path)
                     result = analyze_text(text)
+
+                    seen.add(pdf_url)
+                    doc_fingerprint = build_doc_fingerprint(text, pdf_path)
+                    if doc_fingerprint in seen_docs:
+                        continue
+                    seen_docs.add(doc_fingerprint)
 
                     if result["relevant"]:
                         new_relevant_hits.append(
@@ -737,6 +762,7 @@ def main():
                     print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
 
     save_seen(seen)
+    save_seen_docs(seen_docs)
     save_failed(failed)
 
     if not new_relevant_hits:
