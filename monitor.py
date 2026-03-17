@@ -227,8 +227,14 @@ def normalize_url(u: str) -> str:
     return canonicalize_url(u)
 
 
-
-
+def build_url_fingerprints(u: str) -> set[str]:
+    normalized = canonicalize_url(u)
+    parts = urlsplit(normalized)
+    without_query = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    return {
+        f"url:{normalized}",
+        f"url_noquery:{without_query}",
+    }
 
 def normalize_text_for_fingerprint(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
@@ -727,7 +733,8 @@ def main():
                     continue
 
             for pdf_url in candidate_pdfs:
-                if pdf_url in seen or pdf_url in failed:
+                url_fingerprints = build_url_fingerprints(pdf_url)
+                if pdf_url in seen or pdf_url in failed or any(fp in seen_docs for fp in url_fingerprints):
                     continue
 
                 try:
@@ -736,6 +743,7 @@ def main():
                     result = analyze_text(text)
 
                     seen.add(pdf_url)
+                    seen_docs.update(url_fingerprints)
                     doc_fingerprint = build_doc_fingerprint(text, pdf_path)
                     if doc_fingerprint in seen_docs:
                         continue
