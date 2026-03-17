@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 jobs:
@@ -21,14 +21,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Restore state (seen links + doc fingerprints + downloaded PDFs)
-        uses: actions/cache/restore@v4
-        with:
-          path: data
-          key: planning-board-monitor-state-${{ github.run_id }}
-          restore-keys: |
-            planning-board-monitor-state-
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -40,9 +32,21 @@ jobs:
         run: |
           python monitor.py
 
-      - name: Save state (seen links + doc fingerprints + downloaded PDFs)
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: data
-          key: planning-board-monitor-state-${{ github.run_id }}
+      - name: Commit updated scraper state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for file in data/seen_links.json data/seen_docs.json data/dead_links.json; do
+            if [ -f "$file" ]; then
+              git add "$file"
+            fi
+          done
+
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: persist scraper dedupe state"
+          git push origin HEAD:main
