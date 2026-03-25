@@ -358,6 +358,53 @@ def looks_like_board_doc(a_tag) -> bool:
             return True
     return False
 
+def is_selector_filter_page(html: str, base_url: str) -> bool:
+    low_url = base_url.lower()
+    soup = BeautifulSoup(html, "html.parser")
+
+    if any(k in low_url for k in ("recent?", "filter", "department=", "category=", "documents")):
+        return True
+    if soup.find("form") and soup.find(["select", "input"]):
+        return True
+    if soup.find(["select", "option"]):
+        return True
+    if soup.find(attrs={"data-filter": True}) or soup.find(attrs={"data-category": True}):
+        return True
+    return False
+
+
+def collect_link_debug_info(html: str, base_url: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+
+    anchors = soup.find_all("a")
+    anchor_hrefs = [a.get("href", "").strip() for a in anchors if a.get("href")]
+    raw_hrefs = re.findall(r"""href\s*=\s*["']?([^"' >]+)""", html, flags=re.IGNORECASE)
+
+    candidate_hrefs: list[str] = []
+    for href in anchor_hrefs + raw_hrefs:
+        if not href:
+            continue
+        full = normalize_url(requests.compat.urljoin(base_url, href))
+        candidate_hrefs.append(full)
+
+    first_candidates = list(dict.fromkeys(candidate_hrefs))[:20]
+    pdf_like_count = sum(1 for h in candidate_hrefs if ".pdf" in h.lower())
+
+    return {
+        "anchor_count": len(anchors),
+        "raw_href_count": len(raw_hrefs),
+        "pdf_href_count": pdf_like_count,
+        "first_candidate_hrefs": first_candidates,
+        "has_iframe": bool(soup.find("iframe")),
+        "has_embed": bool(soup.find("embed")),
+        "has_object": bool(soup.find("object")),
+        "has_script_doc_pattern": bool(
+            re.search(r"(agenda|minutes|document|viewfile|\.pdf)", html, flags=re.IGNORECASE)
+            and soup.find("script")
+        ),
+        "is_selector_filter_page": is_selector_filter_page(html, base_url),
+    }
+
 
 def extract_agendacenter_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -386,7 +433,7 @@ def extract_agendacenter_links(html: str, base_url: str) -> list[str]:
     return out
 
 
-def extract_pdf_links(html: str, base_url: str) -> list[str]:
+def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     links: list[str] = []
 
@@ -394,7 +441,7 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
         links.extend(extract_agendacenter_links(html, base_url))
 
     for a in soup.find_all("a", href=True):
-        if not looks_like_board_doc(a):
+        if not relaxed and not looks_like_board_doc(a):
             continue
 
         href = a["href"].strip()
@@ -426,6 +473,25 @@ def extract_pdf_links(html: str, base_url: str) -> list[str]:
             seen.add(l)
     return out
 
+def extract_intermediate_links(html: str, base_url: str, relaxed: bool = False) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links: list[str] = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        full = normalize_url(requests.compat.urljoin(base_url, href))
+        low = full.lower()
+        path = urlsplit(full).path.lower()
+
+        if path.endswith(".pdf"):
+            continue
+
+        hint_match = looks_like_board_doc(a) or any(k in low for k in LINK_HINTS)
+        if hint_match or relaxed:
+            if any(k in low for k in ("agenda", "minutes", "meeting", "document", "viewfile", "documents")):
+                links.append(full)
+
+    return list(dict.fromkeys(links))
 
 def is_viewer_page(url: str) -> bool:
     low = url.lower()
@@ -482,6 +548,52 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
             filtered.append(u)
 
     return filtered or out
+
+def resolve_intermediate_links_to_pdfs(links: list[str], max_pages: int = 10) -> list[str]:
+    found: list[str] = []
+    for link in links[:max_pages]:
+        try:
+            html = fetch_html(link)
+            found.extend(extract_pdf_links(html, link, relaxed=True))
+
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup.find_all(["iframe", "embed", "object"], src=True):
+                src = (tag.get("src") or "").strip()
+                if not src:
+                    continue
+                full = normalize_url(requests.compat.urljoin(link, src))
+                if ".pdf" in full.lower() or "/agendacenter/viewfile/" in full.lower():
+                    found.append(full)
+        except Exception:
+            continue
+
+    return list(dict.fromkeys(found))
+
+
+def maybe_switch_eastampton_page(page_url: str, html: str) -> tuple[str, str]:
+    low = page_url.lower()
+    if "eastampton" not in low:
+        return page_url, html
+
+    soup = BeautifulSoup(html, "html.parser")
+    if not ("recent" in low or "department=" in low):
+        return page_url, html
+
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        label = " ".join(a.stripped_strings).lower()
+        href_low = href.lower()
+        if any(k in href_low or k in label for k in ("agendas", "minutes")) and any(
+            k in href_low or k in label for k in ("planning", "zoning", "land use", "board", "agenda", "minutes")
+        ):
+            new_url = normalize_url(requests.compat.urljoin(page_url, href))
+            if new_url != page_url:
+                try:
+                    return new_url, fetch_html(new_url)
+                except Exception:
+                    return page_url, html
+    return page_url, html
+
 
 
 # -------------------------
@@ -716,9 +828,37 @@ def main():
             print(f"[ERROR] Fetch page failed: {town} {page_url} -> {e}")
             continue
 
-        pdf_links = extract_pdf_links(html, page_url)[:20]
+        if town == "Eastampton":
+            page_url, html = maybe_switch_eastampton_page(page_url, html)
+
+        relaxed_mode = is_selector_filter_page(html, page_url)
+        pdf_links = extract_pdf_links(html, page_url, relaxed=relaxed_mode)
+
+        intermediate_links: list[str] = []
+        if relaxed_mode or not pdf_links:
+            intermediate_links = extract_intermediate_links(html, page_url, relaxed=relaxed_mode)
+            if intermediate_links:
+                pdf_links.extend(resolve_intermediate_links_to_pdfs(intermediate_links))
+
+        pdf_links = list(dict.fromkeys(pdf_links))[:20]
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
+        if not pdf_links:
+            dbg = collect_link_debug_info(html, page_url)
+            print(
+                "[DEBUG] "
+                f"{town}: anchors={dbg['anchor_count']} raw_hrefs={dbg['raw_href_count']} "
+                f"pdf_hrefs={dbg['pdf_href_count']}"
+            )
+            print(
+                "[DEBUG] "
+                f"{town}: iframe={dbg['has_iframe']} embed={dbg['has_embed']} object={dbg['has_object']} "
+                f"script_doc_pattern={dbg['has_script_doc_pattern']}"
+            )
+            print(f"[DEBUG] {town}: selector_filter_page={dbg['is_selector_filter_page']}")
+            print(f"[DEBUG] {town}: first_20_candidate_hrefs={dbg['first_candidate_hrefs']}")
+
+        
         for link in pdf_links:
             if link in seen or link in failed:
                 continue
