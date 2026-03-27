@@ -100,6 +100,37 @@ LINK_HINTS = (
     "joint land use",
 )
 
+BOARD_RELEVANCE_HINTS = (
+    "planning",
+    "zoning",
+    "land use",
+    "land development",
+    "board",
+    "agenda",
+    "minutes",
+    "resolution",
+    "hearing",
+    "application",
+    "subdivision",
+)
+
+UNRELATED_DOC_HINTS = (
+    "vital statistics",
+    "police",
+    "parks",
+    "tax",
+    "tax collector",
+    "brush pickup",
+    "opra",
+    "recycling",
+    "clerk",
+    "animal control",
+    "finance",
+    "court",
+    "fire",
+    "ems",
+)
+
 # =========================
 # Residential-only filter
 # =========================
@@ -358,6 +389,42 @@ def looks_like_board_doc(a_tag) -> bool:
             return True
     return False
 
+def _extract_anchor_context_text(a_tag) -> str:
+    parts: list[str] = []
+    txt = " ".join(a_tag.stripped_strings).strip()
+    if txt:
+        parts.append(txt)
+    for attr in ("title", "aria-label"):
+        v = (a_tag.get(attr) or "").strip()
+        if v:
+            parts.append(v)
+
+    parent = a_tag.parent
+    if parent:
+        ptxt = " ".join(parent.stripped_strings).strip()
+        if ptxt:
+            parts.append(ptxt[:220])
+
+    prev_heading = a_tag.find_previous(["h1", "h2", "h3", "h4", "h5"])
+    if prev_heading:
+        htxt = " ".join(prev_heading.stripped_strings).strip()
+        if htxt:
+            parts.append(htxt)
+
+    return " ".join(parts).lower()
+
+
+def is_board_relevant_link(url: str, context_text: str) -> bool:
+    low = f"{url.lower()} {context_text.lower()}"
+    return any(k in low for k in BOARD_RELEVANCE_HINTS)
+
+
+def looks_unrelated_doc(url: str, context_text: str) -> bool:
+    low = f"{url.lower()} {context_text.lower()}"
+    return any(k in low for k in UNRELATED_DOC_HINTS)
+
+
+
 def is_pdf_source_url(url: str) -> bool:
     low = url.lower()
     path = urlsplit(url).path.lower()
@@ -470,7 +537,8 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
     if "/agendacenter/" in base_url.lower():
         links.extend(extract_agendacenter_links(html, base_url))
 
-    filtered_by_link_hints = 0    
+    filtered_by_link_hints = 0
+    filtered_unrelated = 0
     for a in soup.find_all("a", href=True):
 
         href = a["href"].strip()
@@ -480,12 +548,22 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
         low = full.lower()
         path = urlsplit(full).path.lower()
 
-        # Always include direct PDF sources regardless of anchor text.
+        context_text = _extract_anchor_context_text(a)
+        board_relevant = is_board_relevant_link(full, context_text)
+        unrelated = looks_unrelated_doc(full, context_text)
+
+        # Keep board-specific PDF sources; skip obvious unrelated municipal docs.
         if is_pdf_source_url(full):
+            if unrelated and not board_relevant:
+                filtered_unrelated += 1
+                continue
+            if "/documentcenter/view/" in low and not (board_relevant or effective_relaxed):
+                filtered_by_link_hints += 1
+                continue
             links.append(full)
             continue
 
-        if not effective_relaxed and not looks_like_board_doc(a):
+        if not effective_relaxed and not (looks_like_board_doc(a) or board_relevant):
             filtered_by_link_hints += 1
             continue
         
@@ -508,6 +586,8 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
             seen.add(l)
     if filtered_by_link_hints:
         print(f"[DEBUG] {base_url}: filtered_by=LINK_HINTS count={filtered_by_link_hints}")
+    if filtered_unrelated:
+        print(f"[DEBUG] {base_url}: filtered_by=UNRELATED_DOC_HINTS count={filtered_unrelated}")
     return out
 
 def extract_intermediate_links(html: str, base_url: str, relaxed: bool = False) -> list[str]:
@@ -523,11 +603,24 @@ def extract_intermediate_links(html: str, base_url: str, relaxed: bool = False) 
         if path.endswith(".pdf"):
             continue
 
-        hint_match = looks_like_board_doc(a) or any(k in low for k in LINK_HINTS)
+        context_text = _extract_anchor_context_text(a)
+        hint_match = looks_like_board_doc(a) or any(k in low for k in LINK_HINTS) or is_board_relevant_link(full, context_text)
         if hint_match or relaxed:
             if any(k in low for k in ("agenda", "minutes", "meeting", "document", "viewfile", "documents")):
                 links.append(full)
 
+    return list(dict.fromkeys(links))
+
+def extract_script_document_links(html: str, base_url: str) -> list[str]:
+    url_re = re.compile(
+        r"""["']([^"']*(?:\.pdf(?:\?[^"']*)?|/documentcenter/view/[^"']*|/agendacenter/viewfile/[^"']*))["']""",
+        re.IGNORECASE,
+    )
+    links: list[str] = []
+    for raw in url_re.findall(html):
+        full = normalize_url(requests.compat.urljoin(base_url, raw.strip()))
+        if is_pdf_source_url(full):
+            links.append(full)
     return list(dict.fromkeys(links))
 
 def is_viewer_page(url: str) -> bool:
@@ -603,12 +696,20 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
 
     return filtered or out
 
-def resolve_intermediate_links_to_pdfs(links: list[str], max_pages: int = 10) -> list[str]:
+def resolve_intermediate_links_to_pdfs(links: list[str], max_pages: int = 10, max_depth: int = 2) -> list[str]:
     found: list[str] = []
-    for link in links[:max_pages]:
+    queue: list[tuple[str, int]] = [(l, 0) for l in links[:max_pages]]
+    visited: set[str] = set()
+
+    while queue:
+        link, depth = queue.pop(0)
+        if link in visited:
+            continue
+        visited.add(link)
         try:
             html = fetch_html(link)
             found.extend(extract_pdf_links(html, link, relaxed=True))
+            found.extend(extract_script_document_links(html, link))
 
             soup = BeautifulSoup(html, "html.parser")
             for tag in soup.find_all(["iframe", "embed", "object"]):
@@ -619,7 +720,13 @@ def resolve_intermediate_links_to_pdfs(links: list[str], max_pages: int = 10) ->
                         continue
                     full = normalize_url(requests.compat.urljoin(link, candidate))
                     if is_pdf_source_url(full):
-                        found.append(full)                
+                        found.append(full)
+
+            if depth < max_depth:
+                nested = extract_intermediate_links(html, link, relaxed=True)
+                for n in nested[:max_pages]:
+                    if n not in visited:
+                        queue.append((n, depth + 1))         
         except Exception:
             continue
 
@@ -670,12 +777,22 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
     if no_query != url:
         candidates.append(no_query)
 
-    if parts.netloc and not parts.netloc.startswith("www."):
-        www = urlunsplit((parts.scheme, "www." + parts.netloc, parts.path, parts.query, parts.fragment))
-        candidates.append(canonicalize_url(www))
-    elif parts.netloc.startswith("www."):
-        bare = urlunsplit((parts.scheme, parts.netloc[4:], parts.path, parts.query, parts.fragment))
-        candidates.append(canonicalize_url(bare))
+    low = url.lower()
+    is_document_center = "/documentcenter/view/" in low
+    if is_document_center:
+        m = re.search(r"/documentcenter/view/(\d+)", parts.path, flags=re.IGNORECASE)
+        if m:
+            doc_id = m.group(1)
+            for path_variant in (f"/DocumentCenter/View/{doc_id}", f"/DocumentCenter/View/{doc_id}/"):
+                v = urlunsplit((parts.scheme, parts.netloc, path_variant, parts.query, ""))
+                candidates.append(canonicalize_url(v))
+    else:
+        if parts.netloc and not parts.netloc.startswith("www."):
+            www = urlunsplit((parts.scheme, "www." + parts.netloc, parts.path, parts.query, parts.fragment))
+            candidates.append(canonicalize_url(www))
+        elif parts.netloc.startswith("www."):
+            bare = urlunsplit((parts.scheme, parts.netloc[4:], parts.path, parts.query, parts.fragment))
+            candidates.append(canonicalize_url(bare))
 
     deduped = []
     seen_c = set()
@@ -708,6 +825,7 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
                 )
 
                 if r.status_code == 404:
+                    print(f"[DEBUG] download candidate 404: {cand}")
                     last_err = RuntimeError(f"404 Not Found: {cand}")
                     continue
 
@@ -720,10 +838,12 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
                 if ("pdf" not in ctype) and (not content.startswith(b"%PDF")):
                     raise RuntimeError(f"Response did not look like a PDF (content-type={ctype})")
 
+                print(f"[DEBUG] download candidate success: {cand}")                
                 path.write_bytes(content)
                 return path, saw_non_404
 
             except Exception as e:
+                print(f"[DEBUG] download candidate failed: {cand} -> {e}")
                 last_err = e
 
         return None, saw_non_404
@@ -877,7 +997,8 @@ def main():
     for site in TARGET_SITES:
         town = site["town"]
         page_url = site["url"]
-
+        town_reasons: set[str] = set()
+        
         try:
             html = fetch_html(page_url)
         except Exception as e:
@@ -886,10 +1007,15 @@ def main():
 
         if town == "Eastampton":
             page_url, html = maybe_switch_eastampton_page(page_url, html)
-
+        if "drive.google.com/drive/folders/" in page_url.lower():
+            town_reasons.add("unsupported_source")
+            print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
+            continue
+        
         relaxed_mode = is_selector_filter_page(html, page_url)
         pdf_links = extract_pdf_links(html, page_url, relaxed=relaxed_mode)
-
+        pdf_links.extend(extract_script_document_links(html, page_url))
+        
         intermediate_links: list[str] = []
         should_follow_intermediate = (
             relaxed_mode
@@ -899,13 +1025,22 @@ def main():
         if should_follow_intermediate:
             intermediate_links = extract_intermediate_links(html, page_url, relaxed=relaxed_mode)
             if intermediate_links:
-                pdf_links.extend(resolve_intermediate_links_to_pdfs(intermediate_links))
-
+                resolved_intermediate = resolve_intermediate_links_to_pdfs(intermediate_links)
+                if resolved_intermediate:
+                    pdf_links.extend(resolved_intermediate)
+                else:
+                    town_reasons.add("intermediate_page_not_followed")
+                    
         pdf_links = list(dict.fromkeys(pdf_links))[:20]
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
         if not pdf_links:
             dbg = collect_link_debug_info(html, page_url)
+            town_reasons.add("no_links_found")
+            if dbg["pdf_href_count"] > 0:
+                town_reasons.add("filtered_out")
+            if dbg["anchor_count"] == 0 and dbg["has_script_doc_pattern"]:
+                town_reasons.add("likely_js_rendered")            
             print(
                 "[DEBUG] "
                 f"{town}: anchors={dbg['anchor_count']} raw_hrefs={dbg['raw_href_count']} "
@@ -974,8 +1109,12 @@ def main():
                     msg = str(e).lower()
                     if "all download candidates returned 404" in msg or msg.startswith("404 not found"):
                         failed.add(pdf_url)
+                        town_reasons.add("download_404")
                     print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
-
+                    
+        if town_reasons:
+            print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
+    
     save_seen(seen)
     save_seen_docs(seen_docs)
     save_failed(failed)
