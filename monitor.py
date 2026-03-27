@@ -358,6 +358,15 @@ def looks_like_board_doc(a_tag) -> bool:
             return True
     return False
 
+def is_pdf_source_url(url: str) -> bool:
+    low = url.lower()
+    path = urlsplit(url).path.lower()
+    return (
+        path.endswith(".pdf")
+        or "/documentcenter/view/" in low
+        or "/agendacenter/viewfile/" in low
+    )
+
 def is_selector_filter_page(html: str, base_url: str) -> bool:
     low_url = base_url.lower()
     soup = BeautifulSoup(html, "html.parser")
@@ -388,8 +397,18 @@ def collect_link_debug_info(html: str, base_url: str) -> dict:
         candidate_hrefs.append(full)
 
     first_candidates = list(dict.fromkeys(candidate_hrefs))[:20]
-    pdf_like_count = sum(1 for h in candidate_hrefs if ".pdf" in h.lower())
-
+    pdf_like_count = sum(1 for h in candidate_hrefs if is_pdf_source_url(h))
+    filtered_by_link_hints: list[str] = []
+    for a in anchors:
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        full = normalize_url(requests.compat.urljoin(base_url, href))
+        if not is_pdf_source_url(full):
+            continue
+        if not looks_like_board_doc(a):
+            filtered_by_link_hints.append(full)
+            
     return {
         "anchor_count": len(anchors),
         "raw_href_count": len(raw_hrefs),
@@ -403,6 +422,8 @@ def collect_link_debug_info(html: str, base_url: str) -> dict:
             and soup.find("script")
         ),
         "is_selector_filter_page": is_selector_filter_page(html, base_url),
+        "filtered_by_link_hints_count": len(filtered_by_link_hints),
+        "filtered_by_link_hints_examples": list(dict.fromkeys(filtered_by_link_hints))[:10],        
     }
 
 
@@ -436,13 +457,21 @@ def extract_agendacenter_links(html: str, base_url: str) -> list[str]:
 def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     links: list[str] = []
+    effective_relaxed = relaxed
 
+    # If we can already see PDF-like hrefs on the page, do not gate on LINK_HINTS.
+    page_has_pdf_hrefs = any(
+        is_pdf_source_url(normalize_url(requests.compat.urljoin(base_url, (a.get("href") or "").strip())))
+        for a in soup.find_all("a", href=True)
+    )
+    if page_has_pdf_hrefs:
+        effective_relaxed = True
+    
     if "/agendacenter/" in base_url.lower():
         links.extend(extract_agendacenter_links(html, base_url))
 
+    filtered_by_link_hints = 0    
     for a in soup.find_all("a", href=True):
-        if not relaxed and not looks_like_board_doc(a):
-            continue
 
         href = a["href"].strip()
         full = requests.compat.urljoin(base_url, href)
@@ -451,6 +480,15 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
         low = full.lower()
         path = urlsplit(full).path.lower()
 
+        # Always include direct PDF sources regardless of anchor text.
+        if is_pdf_source_url(full):
+            links.append(full)
+            continue
+
+        if not effective_relaxed and not looks_like_board_doc(a):
+            filtered_by_link_hints += 1
+            continue
+        
         if "agendaviewer.php" in low:
             links.append(full)
             continue
@@ -460,9 +498,6 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
             continue
 
         if path.endswith(".pdf"):
-            doccenter_markers = ("documentcenter", "document_center", "document%20center", "document center")
-            if any(m in path for m in doccenter_markers):
-                continue
             links.append(full)
 
     out: list[str] = []
@@ -471,6 +506,8 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
         if l not in seen:
             out.append(l)
             seen.add(l)
+    if filtered_by_link_hints:
+        print(f"[DEBUG] {base_url}: filtered_by=LINK_HINTS count={filtered_by_link_hints}")
     return out
 
 def extract_intermediate_links(html: str, base_url: str, relaxed: bool = False) -> list[str]:
@@ -534,6 +571,23 @@ def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
         full = requests.compat.urljoin(viewer_url, src)
         add(full)
 
+    for tag in soup.find_all("object"):
+        data = (tag.get("data") or "").strip()
+        src = (tag.get("src") or "").strip()
+        for candidate in (data, src):
+            if not candidate:
+                continue
+            full = requests.compat.urljoin(viewer_url, candidate)
+            add(full)
+
+    script_url_re = re.compile(
+        r"""["']([^"']*(?:\.pdf(?:\?[^"']*)?|/agendacenter/viewfile/[^"']*|/documentcenter/view/[^"']*))["']""",
+        re.IGNORECASE,
+    )
+    for match in script_url_re.findall(html):
+        full = requests.compat.urljoin(viewer_url, match.strip())
+        add(full)
+    
     out: list[str] = []
     seen_local: set[str] = set()
     for u in found:
@@ -557,13 +611,15 @@ def resolve_intermediate_links_to_pdfs(links: list[str], max_pages: int = 10) ->
             found.extend(extract_pdf_links(html, link, relaxed=True))
 
             soup = BeautifulSoup(html, "html.parser")
-            for tag in soup.find_all(["iframe", "embed", "object"], src=True):
+            for tag in soup.find_all(["iframe", "embed", "object"]):
                 src = (tag.get("src") or "").strip()
-                if not src:
-                    continue
-                full = normalize_url(requests.compat.urljoin(link, src))
-                if ".pdf" in full.lower() or "/agendacenter/viewfile/" in full.lower():
-                    found.append(full)
+                data = (tag.get("data") or "").strip()
+                for candidate in (src, data):
+                    if not candidate:
+                        continue
+                    full = normalize_url(requests.compat.urljoin(link, candidate))
+                    if is_pdf_source_url(full):
+                        found.append(full)                
         except Exception:
             continue
 
@@ -835,7 +891,12 @@ def main():
         pdf_links = extract_pdf_links(html, page_url, relaxed=relaxed_mode)
 
         intermediate_links: list[str] = []
-        if relaxed_mode or not pdf_links:
+        should_follow_intermediate = (
+            relaxed_mode
+            or not pdf_links
+            or "evesham-nj.org/meetings/meeting-documents" in page_url.lower()
+        )
+        if should_follow_intermediate:
             intermediate_links = extract_intermediate_links(html, page_url, relaxed=relaxed_mode)
             if intermediate_links:
                 pdf_links.extend(resolve_intermediate_links_to_pdfs(intermediate_links))
@@ -857,7 +918,10 @@ def main():
             )
             print(f"[DEBUG] {town}: selector_filter_page={dbg['is_selector_filter_page']}")
             print(f"[DEBUG] {town}: first_20_candidate_hrefs={dbg['first_candidate_hrefs']}")
-
+            print(
+                f"[DEBUG] {town}: filtered_by_LINK_HINTS={dbg['filtered_by_link_hints_count']} "
+                f"examples={dbg['filtered_by_link_hints_examples']}"
+            )
         
         for link in pdf_links:
             if link in seen or link in failed:
