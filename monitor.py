@@ -12,11 +12,11 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote, unqu
 
 import requests
 import pdfplumber
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 logging.getLogger("pdfminer").setLevel(logging.ERROR)  # silence FontBBox/pdfminer noise
-
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # =========================
 # CONFIG — EDIT THESE
@@ -130,6 +130,10 @@ UNRELATED_DOC_HINTS = (
     "fire",
     "ems",
 )
+
+JS_RENDERED_DOMAINS = {
+    "ecode360.com",
+}
 
 # =========================
 # Residential-only filter
@@ -334,6 +338,21 @@ def fetch_html(url: str) -> str:
 
     raise RuntimeError(str(last_err) if last_err else "Unknown fetch_html error")
 
+def is_xml_like_document(text: str) -> bool:
+    sample = (text or "").lstrip()[:400].lower()
+    return (
+        sample.startswith("<?xml")
+        or sample.startswith("<rss")
+        or sample.startswith("<feed")
+        or "<urlset" in sample
+        or "<sitemapindex" in sample
+    )
+
+
+def make_soup(text: str) -> BeautifulSoup:
+    parser = "xml" if is_xml_like_document(text) else "html.parser"
+    return BeautifulSoup(text, parser)
+
 
 # -------------------------
 # Revize helpers
@@ -436,7 +455,7 @@ def is_pdf_source_url(url: str) -> bool:
 
 def is_selector_filter_page(html: str, base_url: str) -> bool:
     low_url = base_url.lower()
-    soup = BeautifulSoup(html, "html.parser")
+    soup = make_soup(html)
 
     if any(k in low_url for k in ("recent?", "filter", "department=", "category=", "documents")):
         return True
@@ -450,7 +469,7 @@ def is_selector_filter_page(html: str, base_url: str) -> bool:
 
 
 def collect_link_debug_info(html: str, base_url: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = make_soup(html)
 
     anchors = soup.find_all("a")
     anchor_hrefs = [a.get("href", "").strip() for a in anchors if a.get("href")]
@@ -495,7 +514,7 @@ def collect_link_debug_info(html: str, base_url: str) -> dict:
 
 
 def extract_agendacenter_links(html: str, base_url: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = make_soup(html)
     links: list[str] = []
 
     for a in soup.find_all("a", href=True):
@@ -522,7 +541,7 @@ def extract_agendacenter_links(html: str, base_url: str) -> list[str]:
 
 
 def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = make_soup(html)
     links: list[str] = []
     effective_relaxed = relaxed
 
@@ -591,7 +610,7 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
     return out
 
 def extract_intermediate_links(html: str, base_url: str, relaxed: bool = False) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = make_soup(html)
     links: list[str] = []
 
     for a in soup.find_all("a", href=True):
@@ -637,7 +656,7 @@ def is_viewer_page(url: str) -> bool:
 
 def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
     html = fetch_html(viewer_url)
-    soup = BeautifulSoup(html, "html.parser")
+    soup = make_soup(html)
 
     found: list[str] = []
 
@@ -711,7 +730,7 @@ def resolve_intermediate_links_to_pdfs(links: list[str], max_pages: int = 10, ma
             found.extend(extract_pdf_links(html, link, relaxed=True))
             found.extend(extract_script_document_links(html, link))
 
-            soup = BeautifulSoup(html, "html.parser")
+            soup = make_soup(html)
             for tag in soup.find_all(["iframe", "embed", "object"]):
                 src = (tag.get("src") or "").strip()
                 data = (tag.get("data") or "").strip()
@@ -732,13 +751,56 @@ def resolve_intermediate_links_to_pdfs(links: list[str], max_pages: int = 10, ma
 
     return list(dict.fromkeys(found))
 
+def extract_board_child_pages(html: str, base_url: str) -> list[str]:
+    soup = make_soup(html)
+    child_pages: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        full = normalize_url(requests.compat.urljoin(base_url, href))
+        low = full.lower()
+        anchor_text = " ".join(a.stripped_strings).lower()
+        joined = f"{low} {anchor_text}"
+        if any(k in joined for k in ("planning", "zoning", "land use", "land development", "agenda", "minutes", "board")):
+            if not is_pdf_source_url(full):
+                child_pages.append(full)
+    return list(dict.fromkeys(child_pages))
+
+
+def extract_embedded_document_links(html: str, base_url: str) -> list[str]:
+    soup = make_soup(html)
+    sources: list[str] = []
+    for tag in soup.find_all(["iframe", "embed", "object"]):
+        for attr in ("src", "data"):
+            raw = (tag.get(attr) or "").strip()
+            if not raw:
+                continue
+            full = normalize_url(requests.compat.urljoin(base_url, raw))
+            sources.append(full)
+
+    links: list[str] = []
+    for src in list(dict.fromkeys(sources))[:6]:
+        if is_pdf_source_url(src):
+            links.append(src)
+            continue
+        try:
+            child_html = fetch_html(src)
+        except Exception:
+            continue
+        links.extend(extract_pdf_links(child_html, src, relaxed=True))
+        links.extend(extract_script_document_links(child_html, src))
+        child_intermediate = extract_intermediate_links(child_html, src, relaxed=True)
+        if child_intermediate:
+            links.extend(resolve_intermediate_links_to_pdfs(child_intermediate, max_pages=8, max_depth=2))
+    return list(dict.fromkeys(links))
 
 def maybe_switch_eastampton_page(page_url: str, html: str) -> tuple[str, str]:
     low = page_url.lower()
     if "eastampton" not in low:
         return page_url, html
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = make_soup(html)
     if not ("recent" in low or "department=" in low):
         return page_url, html
 
@@ -757,7 +819,16 @@ def maybe_switch_eastampton_page(page_url: str, html: str) -> tuple[str, str]:
                     return page_url, html
     return page_url, html
 
+def get_fallback_urls_for_town(town: str, page_url: str) -> list[str]:
+    low = page_url.lower()
+    fallbacks: list[str] = []
 
+    if town in {"Hainesport", "Westampton"} and "/agenda/2026" in low:
+        fallbacks.append(normalize_url(page_url.replace("/agenda/2026", "/agenda")))
+    if town == "Eastampton" and "/meetings/recent" in low:
+        fallbacks.append("https://www.eastampton.com/meetings")
+
+    return list(dict.fromkeys(fallbacks))
 
 # -------------------------
 # Download PDF
@@ -1013,6 +1084,9 @@ def main():
             continue
         
         relaxed_mode = is_selector_filter_page(html, page_url)
+        if town in {"East Greenwich", "Burlington"}:
+            # board-focused index pages with generic anchor labels
+            relaxed_mode = True
         pdf_links = extract_pdf_links(html, page_url, relaxed=relaxed_mode)
         pdf_links.extend(extract_script_document_links(html, page_url))
         
@@ -1028,8 +1102,45 @@ def main():
                 resolved_intermediate = resolve_intermediate_links_to_pdfs(intermediate_links)
                 if resolved_intermediate:
                     pdf_links.extend(resolved_intermediate)
-                else:
+                elif not pdf_links:
                     town_reasons.add("intermediate_page_not_followed")
+
+
+        if town in {"Cherry Hill", "East Greenwich", "Burlington"}:
+            child_pages = extract_board_child_pages(html, page_url)
+            for child_url in child_pages[:8]:
+                try:
+                    child_html = fetch_html(child_url)
+                except Exception:
+                    continue
+                child_links = extract_pdf_links(child_html, child_url, relaxed=True)
+                child_links.extend(extract_script_document_links(child_html, child_url))
+                if not child_links:
+                    child_intermediate = extract_intermediate_links(child_html, child_url, relaxed=True)
+                    if child_intermediate:
+                        child_links.extend(resolve_intermediate_links_to_pdfs(child_intermediate, max_pages=10, max_depth=2))
+                pdf_links.extend(child_links)
+
+        if town == "East Greenwich":
+            pdf_links.extend(extract_embedded_document_links(html, page_url))
+
+        if not pdf_links:
+            for fallback_url in get_fallback_urls_for_town(town, page_url):
+                try:
+                    fallback_html = fetch_html(fallback_url)
+                except Exception:
+                    continue
+                fallback_links = extract_pdf_links(fallback_html, fallback_url, relaxed=True)
+                fallback_links.extend(extract_script_document_links(fallback_html, fallback_url))
+                if not fallback_links:
+                    fallback_intermediate = extract_intermediate_links(fallback_html, fallback_url, relaxed=True)
+                    if fallback_intermediate:
+                        fallback_links.extend(resolve_intermediate_links_to_pdfs(fallback_intermediate, max_pages=10, max_depth=2))
+                if fallback_links:
+                    page_url = fallback_url
+                    html = fallback_html
+                    pdf_links.extend(fallback_links)
+                    break
                     
         pdf_links = list(dict.fromkeys(pdf_links))[:20]
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
@@ -1037,10 +1148,15 @@ def main():
         if not pdf_links:
             dbg = collect_link_debug_info(html, page_url)
             town_reasons.add("no_links_found")
-            if dbg["pdf_href_count"] > 0:
-                town_reasons.add("filtered_out")
-            if dbg["anchor_count"] == 0 and dbg["has_script_doc_pattern"]:
-                town_reasons.add("likely_js_rendered")            
+            domain = urlsplit(page_url).netloc.lower().removeprefix("www.")
+            if dbg["anchor_count"] == 0 and dbg["raw_href_count"] == 0 and dbg["has_script_doc_pattern"]:
+                town_reasons.add("likely_js_rendered")
+            if domain in JS_RENDERED_DOMAINS:
+                town_reasons.add("likely_js_rendered")
+            if town in {"Hainesport", "Westampton"} and "/agenda/2026" in page_url.lower():
+                town_reasons.add("wrong_target_url")
+            if town == "Eastampton" and "/meetings/recent" in page_url.lower():
+                town_reasons.add("wrong_target_url")     
             print(
                 "[DEBUG] "
                 f"{town}: anchors={dbg['anchor_count']} raw_hrefs={dbg['raw_href_count']} "
