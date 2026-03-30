@@ -37,7 +37,7 @@ TARGET_SITES = [
     {"town": "West Deptford", "url": "https://www.westdeptford.com/government/meeting_agendas/zoning_board.php"},
     {"town": "Deptford", "url": "https://www.deptford-nj.org/government/agendas-minutes"},
     {"town": "East Greenwich", "url": "https://www.eastgreenwichnj.com/government/planning-and-zoning"},
-        {"town": "East Greenwich", "url": "https://www.eastgreenwichnj.com/government/township-meetings"},
+    {"town": "East Greenwich", "url": "https://www.eastgreenwichnj.com/government/planning-and-zoning"},
     {"town": "Mt. Laurel", "url": "https://www.mountlaurel.com/government/meetings/planning_board_meetings.php"},
     {"town": "Mt. Laurel", "url": "https://www.mountlaurel.com/government/meetings/zoning_board_meetings.php"},
     {"town": "Medford", "url": "https://ecode360.com/ME0295/documents/Zoning_Agendas"},
