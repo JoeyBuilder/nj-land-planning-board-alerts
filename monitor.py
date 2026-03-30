@@ -37,6 +37,7 @@ TARGET_SITES = [
     {"town": "West Deptford", "url": "https://www.westdeptford.com/government/meeting_agendas/zoning_board.php"},
     {"town": "Deptford", "url": "https://www.deptford-nj.org/government/agendas-minutes"},
     {"town": "East Greenwich", "url": "https://www.eastgreenwichnj.com/government/planning-and-zoning"},
+        {"town": "East Greenwich", "url": "https://www.eastgreenwichnj.com/government/township-meetings"},
     {"town": "Mt. Laurel", "url": "https://www.mountlaurel.com/government/meetings/planning_board_meetings.php"},
     {"town": "Mt. Laurel", "url": "https://www.mountlaurel.com/government/meetings/zoning_board_meetings.php"},
     {"town": "Medford", "url": "https://ecode360.com/ME0295/documents/Zoning_Agendas"},
@@ -45,22 +46,22 @@ TARGET_SITES = [
     {"town": "Evesham", "url": "https://evesham-nj.org/meetings/meeting-documents/planning-board-meetings/2026-planning-board-meeting-documents/2026-agendas-planning-board"},
     {"town": "Evesham", "url": "https://evesham-nj.org/meetings/meeting-documents/board-of-adjustment-meetings/2026-zoning-board-of-adjustment-meeting-documents/2026-agendas-zoning-board"},
     {"town": "Berlin Boro", "url": "https://www.berlinnj.org/planning-board/"},
-    {"town": "Hainesport", "url": "https://www.hainesporttownship.com/node/20/agenda"},
+    {"town": "Hainesport", "url": "https://www.hainesporttownship.com/joint-land-use-board/pages/joint-land-use-board-meetings"},
     {"town": "Lumberton", "url": "https://ecode360.com/LU1362/documents/Agendas#category-311119646"},
-    {"town": "Burlington", "url": "https://twp.burlington.nj.us/content/159/82/default.aspx"},
+    {"town": "Burlington", "url": "https://twp.burlington.nj.us/planning-and-zoning"},
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Planning-Board-Meeting-Notices-Agendas-3/?"},
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Zoning-Board-of-Adjustment-Meeting-Notic-4/?"},
     {"town": "Delran", "url": "https://delrantownship.org/document-category/planning-board-agendas-minutes/"},
     {"town": "Delran", "url": "https://delrantownship.org/zoning-board/"},
-    {"town": "Cinnaminson", "url": "https://www.cinnaminsonnj.org/agendas-resolutions-minutes/"},
+    {"town": "Cinnaminson", "url": "https://cinnaminsonnj.org/agendas-resolutions-minutes/"},
     {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-agendas/"},
     {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-minutes/"},
     {"town": "Woolwich", "url": "https://woolwichtwp.org/government/woolwich-township-minutes-agendas/"},
     {"town": "Glassboro", "url": "https://drive.google.com/drive/folders/1hDiaWBWSzM8mxb_rLPYdDWaatzgt9cI4?usp=drive_link"},
     {"town": "Hammonton", "url": "https://www.townofhammonton.org/land-use-board/"},
     {"town": "Southampton", "url": "https://www.southamptonnj.org/government/meetings/land_development_board_.php"},
-    {"town": "Eastampton", "url": "https://www.eastampton.com/meetings"},
-    {"town": "Westampton", "url": "https://www.westamptonnj.gov/node/32/agenda"},
+    {"town": "Eastampton", "url": "https://www.eastampton.com/planning"},
+    {"town": "Westampton", "url": "https://www.westamptonnj.gov/minutes-and-agendas"},
     {"town": "Pemberton Township", "url": "https://www.pemberton-twp.com/government/minutes_ordinances/current_year_meeting_minutes.php"},
     {"town": "Shamong", "url": "https://www.shamong.net/community_county_burlington/meetingsagendasminutes/joint_land_use_board_jlub.php#outer-764sub-771"},
     {"town": "Tabernacle", "url": "https://www.tabernacle-nj.gov/departments/land_development_board/meeting_minutes.php"},
@@ -1205,7 +1206,25 @@ def main():
                     html = fallback_html
                     pdf_links.extend(fallback_links)
                     break
+        
+        if not pdf_links and town in {"Medford", "Lumberton", "Swedesboro"}:
+            obvious_pages = extract_board_child_pages(html, page_url)
+            for obvious_url in obvious_pages[:8]:
+                try:
+                    obvious_html = fetch_html(obvious_url)
+                except Exception:
+                    continue
+                obvious_links = extract_pdf_links(obvious_html, obvious_url, relaxed=True)
+                obvious_links.extend(extract_script_document_links(obvious_html, obvious_url))
+                if not obvious_links:
+                    obvious_intermediate = extract_intermediate_links(obvious_html, obvious_url, relaxed=True)
+                    if obvious_intermediate:
+                        obvious_links.extend(
+                            resolve_intermediate_links_to_pdfs(obvious_intermediate, max_pages=8, max_depth=2)
+                        )
+                pdf_links.extend(obvious_links)
 
+        
         if not pdf_links and town in {"Medford", "Lumberton", "Swedesboro"}:
             embedded_links = extract_embedded_document_links(html, page_url)
             if embedded_links:
