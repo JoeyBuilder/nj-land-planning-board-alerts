@@ -45,22 +45,22 @@ TARGET_SITES = [
     {"town": "Evesham", "url": "https://evesham-nj.org/meetings/meeting-documents/planning-board-meetings/2026-planning-board-meeting-documents/2026-agendas-planning-board"},
     {"town": "Evesham", "url": "https://evesham-nj.org/meetings/meeting-documents/board-of-adjustment-meetings/2026-zoning-board-of-adjustment-meeting-documents/2026-agendas-zoning-board"},
     {"town": "Berlin Boro", "url": "https://www.berlinnj.org/planning-board/"},
-    {"town": "Hainesport", "url": "https://www.hainesporttownship.com/node/20/agenda/2026"},
+    {"town": "Hainesport", "url": "https://www.hainesporttownship.com/node/20/agenda"},
     {"town": "Lumberton", "url": "https://ecode360.com/LU1362/documents/Agendas#category-311119646"},
     {"town": "Burlington", "url": "https://twp.burlington.nj.us/content/159/82/default.aspx"},
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Planning-Board-Meeting-Notices-Agendas-3/?"},
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Zoning-Board-of-Adjustment-Meeting-Notic-4/?"},
     {"town": "Delran", "url": "https://delrantownship.org/document-category/planning-board-agendas-minutes/"},
     {"town": "Delran", "url": "https://delrantownship.org/zoning-board/"},
-    {"town": "Cinnaminson", "url": "https://cinnaminsonnj.org/agendas-resolutions-minutes/"},
+    {"town": "Cinnaminson", "url": "https://www.cinnaminsonnj.org/agendas-resolutions-minutes/"},
     {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-agendas/"},
     {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-minutes/"},
     {"town": "Woolwich", "url": "https://woolwichtwp.org/government/woolwich-township-minutes-agendas/"},
     {"town": "Glassboro", "url": "https://drive.google.com/drive/folders/1hDiaWBWSzM8mxb_rLPYdDWaatzgt9cI4?usp=drive_link"},
     {"town": "Hammonton", "url": "https://www.townofhammonton.org/land-use-board/"},
     {"town": "Southampton", "url": "https://www.southamptonnj.org/government/meetings/land_development_board_.php"},
-    {"town": "Eastampton", "url": "https://www.eastampton.com/meetings/recent?boards-commissions=All&combine=&department=133&field_smart_date_end_value=&field_smart_date_value_1="},
-    {"town": "Westampton", "url": "https://www.westamptonnj.gov/node/32/agenda/2026"},
+    {"town": "Eastampton", "url": "https://www.eastampton.com/meetings"},
+    {"town": "Westampton", "url": "https://www.westamptonnj.gov/node/32/agenda"},
     {"town": "Pemberton Township", "url": "https://www.pemberton-twp.com/government/minutes_ordinances/current_year_meeting_minutes.php"},
     {"town": "Shamong", "url": "https://www.shamong.net/community_county_burlington/meetingsagendasminutes/joint_land_use_board_jlub.php#outer-764sub-771"},
     {"town": "Tabernacle", "url": "https://www.tabernacle-nj.gov/departments/land_development_board/meeting_minutes.php"},
@@ -642,6 +642,42 @@ def extract_script_document_links(html: str, base_url: str) -> list[str]:
             links.append(full)
     return list(dict.fromkeys(links))
 
+def extract_script_navigation_links(html: str, base_url: str) -> list[str]:
+    url_re = re.compile(r"""["']([^"']+)["']""", re.IGNORECASE)
+    links: list[str] = []
+    for raw in url_re.findall(html):
+        if len(raw) < 6:
+            continue
+        raw_low = raw.lower()
+        if raw_low.startswith(("javascript:", "mailto:", "tel:", "#")):
+            continue
+        if not (
+            raw_low.startswith(("http://", "https://", "/"))
+            or "default.aspx" in raw_low
+            or "/content/" in raw_low
+        ):
+            continue
+        full = normalize_url(requests.compat.urljoin(base_url, raw.strip()))
+        full_low = full.lower()
+        if is_pdf_source_url(full):
+            continue
+        if any(
+            k in full_low
+            for k in (
+                "agenda",
+                "minutes",
+                "planning",
+                "zoning",
+                "land-use",
+                "land_use",
+                "landuse",
+                "document",
+                "/content/",
+            )
+        ):
+            links.append(full)
+    return list(dict.fromkeys(links))
+
 def is_viewer_page(url: str) -> bool:
     low = url.lower()
     path = urlsplit(url).path.lower()
@@ -1123,7 +1159,35 @@ def main():
 
         if town == "East Greenwich":
             pdf_links.extend(extract_embedded_document_links(html, page_url))
+            script_nav_links = extract_script_navigation_links(html, page_url)
+            for nav_url in script_nav_links[:8]:
+                try:
+                    nav_html = fetch_html(nav_url)
+                except Exception:
+                    continue
+                nav_links = extract_pdf_links(nav_html, nav_url, relaxed=True)
+                nav_links.extend(extract_script_document_links(nav_html, nav_url))
+                if not nav_links:
+                    nav_intermediate = extract_intermediate_links(nav_html, nav_url, relaxed=True)
+                    if nav_intermediate:
+                        nav_links.extend(resolve_intermediate_links_to_pdfs(nav_intermediate, max_pages=10, max_depth=2))
+                pdf_links.extend(nav_links)
 
+        if town == "Burlington":
+            script_nav_links = extract_script_navigation_links(html, page_url)
+            for nav_url in script_nav_links[:10]:
+                try:
+                    nav_html = fetch_html(nav_url)
+                except Exception:
+                    continue
+                nav_links = extract_pdf_links(nav_html, nav_url, relaxed=True)
+                nav_links.extend(extract_script_document_links(nav_html, nav_url))
+                if not nav_links:
+                    nav_intermediate = extract_intermediate_links(nav_html, nav_url, relaxed=True)
+                    if nav_intermediate:
+                        nav_links.extend(resolve_intermediate_links_to_pdfs(nav_intermediate, max_pages=10, max_depth=2))
+                pdf_links.extend(nav_links)
+        
         if not pdf_links:
             for fallback_url in get_fallback_urls_for_town(town, page_url):
                 try:
@@ -1141,7 +1205,12 @@ def main():
                     html = fallback_html
                     pdf_links.extend(fallback_links)
                     break
-                    
+
+        if not pdf_links and town in {"Medford", "Lumberton", "Swedesboro"}:
+            embedded_links = extract_embedded_document_links(html, page_url)
+            if embedded_links:
+                pdf_links.extend(embedded_links)
+        
         pdf_links = list(dict.fromkeys(pdf_links))[:20]
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
@@ -1156,7 +1225,9 @@ def main():
             if town in {"Hainesport", "Westampton"} and "/agenda/2026" in page_url.lower():
                 town_reasons.add("wrong_target_url")
             if town == "Eastampton" and "/meetings/recent" in page_url.lower():
-                town_reasons.add("wrong_target_url")     
+                town_reasons.add("wrong_target_url")
+            if town == "Cinnaminson" and dbg["anchor_count"] == 0 and dbg["raw_href_count"] == 0:
+                town_reasons.add("wrong_target_url")   
             print(
                 "[DEBUG] "
                 f"{town}: anchors={dbg['anchor_count']} raw_hrefs={dbg['raw_href_count']} "
