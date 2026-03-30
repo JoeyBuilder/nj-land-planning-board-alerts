@@ -494,6 +494,19 @@ def _find_repeated_row_tables(soup: BeautifulSoup) -> list:
             repeated_tables.append(table)
     return repeated_tables
 
+def _anchor_in_table_or_grid(a_tag) -> bool:
+    if a_tag.find_parent(["table", "thead", "tbody", "tfoot", "tr", "td", "th"]):
+        return True
+
+    # Some CMS pages emulate table layouts using ARIA/grid roles.
+    return bool(
+        a_tag.find_parent(
+            attrs={
+                "role": re.compile(r"^(table|grid|row|cell|columnheader|rowheader)$", re.IGNORECASE)
+            }
+        )
+    )
+
 def is_pdf_source_url(url: str) -> bool:
     low = url.lower()
     path = urlsplit(url).path.lower()
@@ -597,14 +610,6 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
 
     repeated_tables = _find_repeated_row_tables(soup)
     repeated_table_ids = {id(t) for t in repeated_tables}
-    
-    # If we can already see PDF-like hrefs on the page, do not gate on LINK_HINTS.
-    page_has_pdf_hrefs = any(
-        is_pdf_source_url(normalize_url(requests.compat.urljoin(base_url, (a.get("href") or "").strip())))
-        for a in soup.find_all("a", href=True)
-    )
-    if page_has_pdf_hrefs:
-        effective_relaxed = True
         
     if "/agendacenter/" in base_url.lower():
         links.extend(extract_agendacenter_links(html, base_url))
@@ -621,7 +626,7 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
         path = urlsplit(full).path.lower()
 
         in_repeated_table = False
-        if a.find_parent(["td", "th"]):
+        if _anchor_in_table_or_grid(a):
             table_parent = a.find_parent("table")
             in_repeated_table = bool(table_parent and id(table_parent) in repeated_table_ids)
 
@@ -631,23 +636,25 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
         board_relevant = is_board_relevant_link(full, context_text)
         unrelated = looks_unrelated_doc(full, context_text)
 
+        table_or_grid_candidate = in_repeated_table or _anchor_in_table_or_grid(a)
+        
         # Keep board-specific PDF sources; skip obvious unrelated municipal docs.
         if is_pdf_source_url(full):
-            if unrelated and not board_relevant and not in_repeated_table:
+            if unrelated and not board_relevant and not table_or_grid_candidate:
                 filtered_unrelated += 1
                 continue
-            if "/documentcenter/view/" in low and not (board_relevant or effective_relaxed or in_repeated_table or icon_based_anchor):
+            if "/documentcenter/view/" in low and not (board_relevant or effective_relaxed or table_or_grid_candidate or icon_based_anchor):
                 filtered_by_link_hints += 1
                 continue
             links.append(full)
             continue
 
-        if in_repeated_table and icon_based_anchor and "javascript:" not in low:
+        if table_or_grid_candidate and icon_based_anchor and "javascript:" not in low:
             if not (unrelated and not board_relevant):
                 links.append(full)
                 continue
 
-        if not effective_relaxed and not in_repeated_table and not (looks_like_board_doc(a) or board_relevant):
+        if not effective_relaxed and not table_or_grid_candidate and not (looks_like_board_doc(a) or board_relevant):
             filtered_by_link_hints += 1
             continue
             
