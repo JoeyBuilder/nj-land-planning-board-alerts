@@ -53,7 +53,7 @@ TARGET_SITES = [
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Zoning-Board-of-Adjustment-Meeting-Notic-4/?"},
     {"town": "Delran", "url": "https://delrantownship.org/document-category/planning-board-agendas-minutes/"},
     {"town": "Delran", "url": "https://delrantownship.org/zoning-board/"},
-    {"town": "Cinnaminson", "url": "https://cinnaminsonnj.org/boards-advisory-committees/"},
+    {"town": "Cinnaminson", "url": "https://cinnaminsonnj.org/agendas-resolutions-minutes/"},
     {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-agendas/"},
     {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-minutes/"},
     {"town": "Woolwich", "url": "https://woolwichtwp.org/government/woolwich-township-minutes-agendas/"},
@@ -444,6 +444,55 @@ def looks_unrelated_doc(url: str, context_text: str) -> bool:
     return any(k in low for k in UNRELATED_DOC_HINTS)
 
 
+def anchor_contains_pdf_icon(a_tag) -> bool:
+    if a_tag.find("img"):
+        return True
+
+    icon_text = " ".join(
+        filter(
+            None,
+            [
+                a_tag.get("title", ""),
+                a_tag.get("aria-label", ""),
+                " ".join(a_tag.get("class", [])),
+            ],
+        )
+    ).lower()
+    if any(k in icon_text for k in ("pdf", "icon", "file", "download", "document")):
+        return True
+
+    for child in a_tag.find_all(["svg", "i", "span"]):
+        child_text = " ".join(
+            filter(
+                None,
+                [
+                    child.get("title", ""),
+                    child.get("aria-label", ""),
+                    child.get("alt", ""),
+                    " ".join(child.get("class", [])),
+                ],
+            )
+        ).lower()
+        if any(k in child_text for k in ("pdf", "icon", "file", "download", "document")):
+            return True
+    return False
+
+
+def _find_repeated_row_tables(soup: BeautifulSoup) -> list:
+    repeated_tables = []
+    for table in soup.find_all("table"):
+        data_rows = 0
+        multi_col_rows = 0
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["td", "th"])
+            if not cells:
+                continue
+            data_rows += 1
+            if len(cells) >= 2:
+                multi_col_rows += 1
+        if data_rows >= 2 and multi_col_rows >= 2:
+            repeated_tables.append(table)
+    return repeated_tables
 
 def is_pdf_source_url(url: str) -> bool:
     low = url.lower()
@@ -546,6 +595,9 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
     links: list[str] = []
     effective_relaxed = relaxed
 
+    repeated_tables = _find_repeated_row_tables(soup)
+    repeated_table_ids = {id(t) for t in repeated_tables}
+    
     # If we can already see PDF-like hrefs on the page, do not gate on LINK_HINTS.
     page_has_pdf_hrefs = any(
         is_pdf_source_url(normalize_url(requests.compat.urljoin(base_url, (a.get("href") or "").strip())))
@@ -553,7 +605,7 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
     )
     if page_has_pdf_hrefs:
         effective_relaxed = True
-    
+        
     if "/agendacenter/" in base_url.lower():
         links.extend(extract_agendacenter_links(html, base_url))
 
@@ -568,25 +620,37 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
         low = full.lower()
         path = urlsplit(full).path.lower()
 
+        in_repeated_table = False
+        if a.find_parent(["td", "th"]):
+            table_parent = a.find_parent("table")
+            in_repeated_table = bool(table_parent and id(table_parent) in repeated_table_ids)
+
+        icon_based_anchor = anchor_contains_pdf_icon(a)
+
         context_text = _extract_anchor_context_text(a)
         board_relevant = is_board_relevant_link(full, context_text)
         unrelated = looks_unrelated_doc(full, context_text)
 
         # Keep board-specific PDF sources; skip obvious unrelated municipal docs.
         if is_pdf_source_url(full):
-            if unrelated and not board_relevant:
+            if unrelated and not board_relevant and not in_repeated_table:
                 filtered_unrelated += 1
                 continue
-            if "/documentcenter/view/" in low and not (board_relevant or effective_relaxed):
+            if "/documentcenter/view/" in low and not (board_relevant or effective_relaxed or in_repeated_table or icon_based_anchor):
                 filtered_by_link_hints += 1
                 continue
             links.append(full)
             continue
 
-        if not effective_relaxed and not (looks_like_board_doc(a) or board_relevant):
+        if in_repeated_table and icon_based_anchor and "javascript:" not in low:
+            if not (unrelated and not board_relevant):
+                links.append(full)
+                continue
+
+        if not effective_relaxed and not in_repeated_table and not (looks_like_board_doc(a) or board_relevant):
             filtered_by_link_hints += 1
             continue
-        
+            
         if "agendaviewer.php" in low:
             links.append(full)
             continue
