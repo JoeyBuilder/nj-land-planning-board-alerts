@@ -48,21 +48,21 @@ TARGET_SITES = [
     {"town": "Berlin Boro", "url": "https://www.berlinnj.org/planning-board/"},
     {"town": "Hainesport", "url": "https://www.hainesporttownship.com/joint-land-use-board/pages/joint-land-use-board-meetings"},
     {"town": "Lumberton", "url": "https://ecode360.com/LU1362/documents/Agendas#category-311119646"},
-    {"town": "Burlington", "url": "https://twp.burlington.nj.us/planning-and-zoning"},
+    {"town": "Burlington", "url": "https://twp.burlington.nj.us/content/159/82/default.aspx"},
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Planning-Board-Meeting-Notices-Agendas-3/?"},
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Zoning-Board-of-Adjustment-Meeting-Notic-4/?"},
     {"town": "Delran", "url": "https://delrantownship.org/document-category/planning-board-agendas-minutes/"},
     {"town": "Delran", "url": "https://delrantownship.org/zoning-board/"},
-    {"town": "Cinnaminson", "url": "https://cinnaminsonnj.org/agendas-resolutions-minutes/"},
+    {"town": "Cinnaminson", "url": "https://cinnaminsonnj.org/boards-advisory-committees/"},
     {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-agendas/"},
     {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-minutes/"},
     {"town": "Woolwich", "url": "https://woolwichtwp.org/government/woolwich-township-minutes-agendas/"},
     {"town": "Glassboro", "url": "https://drive.google.com/drive/folders/1hDiaWBWSzM8mxb_rLPYdDWaatzgt9cI4?usp=drive_link"},
     {"town": "Hammonton", "url": "https://www.townofhammonton.org/land-use-board/"},
     {"town": "Southampton", "url": "https://www.southamptonnj.org/government/meetings/land_development_board_.php"},
-    {"town": "Eastampton", "url": "https://www.eastampton.com/planning"},
-    {"town": "Westampton", "url": "https://www.westamptonnj.gov/minutes-and-agendas"},
-    {"town": "Pemberton Township", "url": "https://www.pemberton-twp.com/government/minutes_ordinances/current_year_meeting_minutes.php"},
+    {"town": "Eastampton", "url": "https://www.eastampton.com/meetings?boards-commissions=2031&combine=&department=All&field_smart_date_end_value=&field_smart_date_value_1="},
+    {"town": "Westampton", "url": "https://www.westamptonnj.gov/node/32/agenda"},
+    {"town": "Westampton", "url": "https://www.westamptonnj.gov/node/32/minutes"},
     {"town": "Shamong", "url": "https://www.shamong.net/community_county_burlington/meetingsagendasminutes/joint_land_use_board_jlub.php#outer-764sub-771"},
     {"town": "Tabernacle", "url": "https://www.tabernacle-nj.gov/departments/land_development_board/meeting_minutes.php"},
     {"town": "Swedesboro", "url": "https://ecode360.com/SW0669/documents/Minutes#category-89893453"},
@@ -832,13 +832,49 @@ def extract_embedded_document_links(html: str, base_url: str) -> list[str]:
             links.extend(resolve_intermediate_links_to_pdfs(child_intermediate, max_pages=8, max_depth=2))
     return list(dict.fromkeys(links))
 
+
+def extract_iframe_and_embed_pages(html: str, base_url: str) -> list[str]:
+    soup = make_soup(html)
+    pages: list[str] = []
+    for tag in soup.find_all(["iframe", "embed", "object"]):
+        for attr in ("src", "data"):
+            raw = (tag.get(attr) or "").strip()
+            if not raw:
+                continue
+            full = normalize_url(requests.compat.urljoin(base_url, raw))
+            if not is_pdf_source_url(full):
+                pages.append(full)
+    return list(dict.fromkeys(pages))
+
+
+def filter_burlington_links(links: list[str]) -> list[str]:
+    keep: list[str] = []
+    for link in links:
+        low = link.lower()
+        if any(
+            bad in low
+            for bad in (
+                "zoning-map",
+                "zoning_map",
+                "master-plan",
+                "master_plan",
+                "reexamination",
+                "land-use-element",
+                "circulation-plan",
+            )
+        ):
+            continue
+        if any(k in low for k in ("agenda", "minutes", "planning-board", "zoning-board", "land-use-board")):
+            keep.append(link)
+    return keep or links
+
 def maybe_switch_eastampton_page(page_url: str, html: str) -> tuple[str, str]:
     low = page_url.lower()
     if "eastampton" not in low:
         return page_url, html
 
     soup = make_soup(html)
-    if not ("recent" in low or "department=" in low):
+    if "boards-commissions=2031" in low:
         return page_url, html
 
     for a in soup.find_all("a", href=True):
@@ -860,10 +896,12 @@ def get_fallback_urls_for_town(town: str, page_url: str) -> list[str]:
     low = page_url.lower()
     fallbacks: list[str] = []
 
-    if town in {"Hainesport", "Westampton"} and "/agenda/2026" in low:
-        fallbacks.append(normalize_url(page_url.replace("/agenda/2026", "/agenda")))
-    if town == "Eastampton" and "/meetings/recent" in low:
-        fallbacks.append("https://www.eastampton.com/meetings")
+    if town == "Westampton" and "/node/32/agenda" in low:
+        fallbacks.append("https://www.westamptonnj.gov/node/32/minutes")
+    if town == "Eastampton" and "boards-commissions=2031" not in low:
+        fallbacks.append(
+            "https://www.eastampton.com/meetings?boards-commissions=2031&combine=&department=All&field_smart_date_end_value=&field_smart_date_value_1="
+        )
 
     return list(dict.fromkeys(fallbacks))
 
@@ -1160,6 +1198,30 @@ def main():
 
         if town == "East Greenwich":
             pdf_links.extend(extract_embedded_document_links(html, page_url))
+            embedded_pages = extract_iframe_and_embed_pages(html, page_url)
+            for embedded_url in embedded_pages[:6]:
+                try:
+                    embedded_html = fetch_html(embedded_url)
+                except Exception:
+                    continue
+                embedded_found = extract_pdf_links(embedded_html, embedded_url, relaxed=True)
+                embedded_found.extend(extract_script_document_links(embedded_html, embedded_url))
+                if not embedded_found:
+                    embedded_child_pages = extract_board_child_pages(embedded_html, embedded_url)
+                    for embedded_child_url in embedded_child_pages[:8]:
+                        try:
+                            embedded_child_html = fetch_html(embedded_child_url)
+                        except Exception:
+                            continue
+                        embedded_found.extend(extract_pdf_links(embedded_child_html, embedded_child_url, relaxed=True))
+                        embedded_found.extend(extract_script_document_links(embedded_child_html, embedded_child_url))
+                    if not embedded_found:
+                        embedded_intermediate = extract_intermediate_links(embedded_html, embedded_url, relaxed=True)
+                        if embedded_intermediate:
+                            embedded_found.extend(
+                                resolve_intermediate_links_to_pdfs(embedded_intermediate, max_pages=10, max_depth=2)
+                            )
+                pdf_links.extend(embedded_found)
             script_nav_links = extract_script_navigation_links(html, page_url)
             for nav_url in script_nav_links[:8]:
                 try:
@@ -1188,6 +1250,7 @@ def main():
                     if nav_intermediate:
                         nav_links.extend(resolve_intermediate_links_to_pdfs(nav_intermediate, max_pages=10, max_depth=2))
                 pdf_links.extend(nav_links)
+            pdf_links = filter_burlington_links(pdf_links)
         
         if not pdf_links:
             for fallback_url in get_fallback_urls_for_town(town, page_url):
@@ -1241,10 +1304,6 @@ def main():
                 town_reasons.add("likely_js_rendered")
             if domain in JS_RENDERED_DOMAINS:
                 town_reasons.add("likely_js_rendered")
-            if town in {"Hainesport", "Westampton"} and "/agenda/2026" in page_url.lower():
-                town_reasons.add("wrong_target_url")
-            if town == "Eastampton" and "/meetings/recent" in page_url.lower():
-                town_reasons.add("wrong_target_url")
             if town == "Cinnaminson" and dbg["anchor_count"] == 0 and dbg["raw_href_count"] == 0:
                 town_reasons.add("wrong_target_url")   
             print(
