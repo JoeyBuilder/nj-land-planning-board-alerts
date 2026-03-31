@@ -1171,9 +1171,9 @@ def _is_burlington_agenda_pdf(link: str, context_text: str = "") -> bool:
 
 
 def extract_hainesport_specific_links(page_url: str, html: str) -> list[str]:
-    soup = make_soup(html)
     print(f"[DEBUG] Hainesport: selected landing page={page_url}")
-    year_url = _extract_latest_year_link(soup, page_url)
+    year_candidates = _extract_year_page_links(html, page_url, required_path_hint="/node/20/agenda/")
+    year_url = year_candidates[0][1] if year_candidates else None
     print(f"[DEBUG] Hainesport: selected year page={year_url or 'none'}")
     if not year_url:
         return []
@@ -1187,11 +1187,19 @@ def extract_hainesport_specific_links(page_url: str, html: str) -> list[str]:
     agenda_pages: list[str] = []
     for a in year_soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
-        full = normalize_url(requests.compat.urljoin(year_url, href))
+        label = " ".join(a.stripped_strings).lower()
         low = full.lower()
         if is_pdf_source_url(full):
             continue
-        if any(k in low for k in ("/agenda/agenda-", "/joint-land-use-board/agenda/", "/planning-board/agenda/", "/zoning-board/agenda/")):
+        if any(
+            k in low
+            for k in (
+                "/agenda/agenda-",
+                "/joint-land-use-board/agenda/",
+                "/planning-board/agenda/",
+                "/zoning-board/agenda/",
+            )
+        ) or ("agenda" in label and "/node/" in low):
             agenda_pages.append(full)
 
     agenda_pages = list(dict.fromkeys(agenda_pages))
@@ -1204,14 +1212,17 @@ def extract_hainesport_specific_links(page_url: str, html: str) -> list[str]:
         except Exception:
             continue
         agenda_soup = make_soup(agenda_html)
+        upload_pdfs: list[str] = []
         for a in agenda_soup.find_all("a", href=True):
             href = (a.get("href") or "").strip()
             label = " ".join(a.stripped_strings).lower()
             full = normalize_url(requests.compat.urljoin(agenda_url, href))
             if not is_pdf_source_url(full):
                 continue
-            if "upload file" in label or full.lower().endswith(".pdf") or ".pdf?" in full.lower():
-                final_pdfs.append(full)
+            if "upload file" in label:
+                upload_pdfs.append(full)
+        if upload_pdfs:
+            final_pdfs.append(upload_pdfs[-1])
     final_pdfs = list(dict.fromkeys(final_pdfs))
     print(f"[DEBUG] Hainesport: final pdf count={len(final_pdfs)}")
     return final_pdfs
@@ -1233,6 +1244,18 @@ def extract_burlington_specific_links(page_url: str, html: str) -> list[str]:
         except Exception:
             continue
         agendas_links = _extract_links_by_label(category_html, category_url, ("agenda",))
+        if not agendas_links:
+            category_soup = make_soup(category_html)
+            for a in category_soup.find_all("a", href=True):
+                href = (a.get("href") or "").strip()
+                if not href:
+                    continue
+                label = " ".join(a.stripped_strings).lower()
+                full = normalize_url(requests.compat.urljoin(category_url, href))
+                if is_pdf_source_url(full):
+                    continue
+                if "agenda" in f"{label} {full.lower()}":
+                    agendas_links.append(full)
         agendas_url = agendas_links[0] if agendas_links else None
         print(f"[DEBUG] Burlington: selected subcategory=agendas url={agendas_url or 'none'}")
         if not agendas_url:
@@ -1242,7 +1265,7 @@ def extract_burlington_specific_links(page_url: str, html: str) -> list[str]:
             agendas_html = fetch_html(agendas_url)
         except Exception:
             continue
-        year_candidates = _extract_year_page_links(agendas_html, agendas_url, required_path_hint="/content/")
+        year_candidates = _extract_year_page_links(agendas_html, agendas_url)
         year_url = year_candidates[0][1] if year_candidates else None
         print(f"[DEBUG] Burlington: selected year={year_url or 'none'}")
         if not year_url:
@@ -1255,12 +1278,30 @@ def extract_burlington_specific_links(page_url: str, html: str) -> list[str]:
 
         year_soup = make_soup(year_html)
         year_pdf_links: list[str] = []
+        agenda_detail_pages: list[str] = []
         for a in year_soup.find_all("a", href=True):
             href = (a.get("href") or "").strip()
             context = _extract_anchor_context_text(a)
+            label = " ".join(a.stripped_strings).lower()
             full = normalize_url(requests.compat.urljoin(year_url, href))
             if _is_burlington_agenda_pdf(full, context):
                 year_pdf_links.append(full)
+                continue
+            if not is_pdf_source_url(full) and "agenda" in f"{label} {full.lower()}":
+                agenda_detail_pages.append(full)
+
+        for detail_url in list(dict.fromkeys(agenda_detail_pages)):
+            try:
+                detail_html = fetch_html(detail_url)
+            except Exception:
+                continue
+            detail_soup = make_soup(detail_html)
+            for a in detail_soup.find_all("a", href=True):
+                href = (a.get("href") or "").strip()
+                context = _extract_anchor_context_text(a)
+                full = normalize_url(requests.compat.urljoin(detail_url, href))
+                if _is_burlington_agenda_pdf(full, context):
+                    year_pdf_links.append(full)
         if not year_pdf_links:
             year_links = extract_pdf_links(year_html, year_url, relaxed=True)
             year_links.extend(extract_script_document_links(year_html, year_url))
