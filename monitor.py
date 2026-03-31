@@ -342,37 +342,61 @@ def fetch_html(url: str) -> str:
     raise RuntimeError(str(last_err) if last_err else "Unknown fetch_html error")
 
 
-def detect_protected_source_reasons(html: str, page_url: str) -> set[str]:
+def detect_protected_source_reasons(html: str, page_url: str) -> tuple[set[str], list[str], bool]:
     low_html = (html or "").lower()
     domain = urlsplit(page_url).netloc.lower().removeprefix("www.")
     reasons: set[str] = set()
+    markers: list[str] = []
 
-    is_cloudflare_gate = any(
-        marker in low_html
-        for marker in (
-            "cloudflare",
-            "cf-chl",
-            "cf-browser-verification",
-            "verify you are human",
-            "checking your browser before accessing",
-            "attention required",
-            "just a moment",
-        )
+    strong_text_markers = [
+        "verify you are human",
+        "security verification",
+        "checking your browser before accessing",
+        "cf-browser-verification",
+        "cf challenge",
+        "cf-chl",
+        "challenge-platform",
+    ]
+    soft_vendor_markers = [
+        "cloudflare",
+        "attention required",
+        "just a moment",
+    ]
+    challenge_markup_markers = [
+        "challenge-form",
+        "cf_chl_",
+        "turnstile",
+        "/cdn-cgi/challenge-platform/",
+    ]
+
+    for marker in strong_text_markers:
+        if marker in low_html:
+            markers.append(marker)
+    for marker in soft_vendor_markers:
+        if marker in low_html:
+            markers.append(marker)
+    for marker in challenge_markup_markers:
+        if marker in low_html:
+            markers.append(marker)
+
+    # "Cloudflare" by itself is too weak. Treat as protected only with strong evidence.
+    strong_marker_hits = [m for m in markers if m in strong_text_markers or m in challenge_markup_markers]
+    has_explicit_verification_text = any(
+        m in low_html for m in ("verify you are human", "security verification")
     )
-    if is_cloudflare_gate:
+    has_challenge_markup = any(m in low_html for m in challenge_markup_markers)
+    has_multiple_strong_signals = len(set(strong_marker_hits)) >= 2
+
+    is_strongly_protected = has_explicit_verification_text or has_challenge_markup or has_multiple_strong_signals
+    if is_strongly_protected:
         reasons.add("protected_source")
         reasons.add("cloudflare_verification")
 
-    if domain == "ecode360.com" and (
-        "verify you are human" in low_html
-        or "cloudflare" in low_html
-        or "cf-chl" in low_html
-        or "challenge-platform" in low_html
-    ):
+    if domain == "ecode360.com" and is_strongly_protected:
         reasons.add("unsupported_protected_source")
 
-    return reasons
-
+    return reasons, sorted(set(markers)), is_strongly_protected
+    
 def is_xml_like_document(text: str) -> bool:
     sample = (text or "").lstrip()[:400].lower()
     return (
@@ -1441,12 +1465,29 @@ def main():
                 print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
             continue
 
-        protected_reasons = detect_protected_source_reasons(html, page_url)
-        if protected_reasons:
+        protected_reasons, protected_markers, strongly_protected = detect_protected_source_reasons(html, page_url)
+        protected_dbg = collect_link_debug_info(html, page_url)
+        has_meaningful_content = (
+            protected_dbg["anchor_count"] > 0
+            or protected_dbg["raw_href_count"] > 0
+            or protected_dbg["pdf_href_count"] > 0
+            or protected_dbg["has_script_doc_pattern"]
+        )
+        if protected_reasons and strongly_protected and not has_meaningful_content:
             town_reasons.update(protected_reasons)
-            print(f"[INFO] {town}: protected source detected, skipping link extraction for {page_url}")
+            print(
+                f"[INFO] {town}: protected source detected, skipping link extraction for {page_url} "
+                f"protected_source_markers={protected_markers}"
+            )
             print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
             continue
+        if protected_reasons and strongly_protected:
+            print(
+                f"[DEBUG] {town}: protection markers present but extraction will continue "
+                f"protected_source_markers={protected_markers} "
+                f"anchors={protected_dbg['anchor_count']} raw_hrefs={protected_dbg['raw_href_count']} "
+                f"pdf_hrefs={protected_dbg['pdf_href_count']}"
+            )
         
         if town == "Eastampton":
             page_url, html = maybe_switch_eastampton_page(page_url, html)
@@ -1558,9 +1599,22 @@ def main():
                     fallback_html = fetch_html(fallback_url)
                 except Exception:
                     continue
-                fallback_protected = detect_protected_source_reasons(fallback_html, fallback_url)
-                if fallback_protected:
+                fallback_protected, fallback_markers, fallback_strong = detect_protected_source_reasons(
+                    fallback_html, fallback_url
+                )
+                fallback_dbg = collect_link_debug_info(fallback_html, fallback_url)
+                fallback_has_meaningful_content = (
+                    fallback_dbg["anchor_count"] > 0
+                    or fallback_dbg["raw_href_count"] > 0
+                    or fallback_dbg["pdf_href_count"] > 0
+                    or fallback_dbg["has_script_doc_pattern"]
+                )
+                if fallback_protected and fallback_strong and not fallback_has_meaningful_content:
                     town_reasons.update(fallback_protected)
+                    print(
+                        f"[DEBUG] {town}: fallback appears protected and empty {fallback_url} "
+                        f"protected_source_markers={fallback_markers}"
+                    )
                     continue
                 fallback_links = extract_pdf_links(fallback_html, fallback_url, relaxed=True)
                 fallback_links.extend(extract_script_document_links(fallback_html, fallback_url))
