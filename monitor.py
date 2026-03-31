@@ -35,7 +35,7 @@ TARGET_SITES = [
     {"town": "Washington Township", "url": "https://www.twp.washington.nj.us/government/boards___commissions/zoning_board/agendas_and_minutes.php"},
     {"town": "West Deptford", "url": "https://www.westdeptford.com/government/meeting_agendas/planning_board.php"},
     {"town": "West Deptford", "url": "https://www.westdeptford.com/government/meeting_agendas/zoning_board.php"},
-    {"town": "Deptford", "url": "https://www.deptford-nj.org/government/agendas-minutes"},
+    {"town": "Deptford", "url": "https://www.deptford-nj.org/boards-committees/meetings"},
     {"town": "East Greenwich", "url": "https://www.eastgreenwichnj.com/government/planning-and-zoning"},
     {"town": "East Greenwich", "url": "https://www.eastgreenwichnj.com/government/planning-and-zoning"},
     {"town": "Mt. Laurel", "url": "https://www.mountlaurel.com/government/meetings/planning_board_meetings.php"},
@@ -46,9 +46,9 @@ TARGET_SITES = [
     {"town": "Evesham", "url": "https://evesham-nj.org/meetings/meeting-documents/planning-board-meetings/2026-planning-board-meeting-documents/2026-agendas-planning-board"},
     {"town": "Evesham", "url": "https://evesham-nj.org/meetings/meeting-documents/board-of-adjustment-meetings/2026-zoning-board-of-adjustment-meeting-documents/2026-agendas-zoning-board"},
     {"town": "Berlin Boro", "url": "https://www.berlinnj.org/planning-board/"},
-    {"town": "Hainesport", "url": "https://www.hainesporttownship.com/joint-land-use-board/pages/joint-land-use-board-meetings"},
+    {"town": "Hainesport", "url": "https://www.hainesporttownship.com/minutes-and-agendas"},
     {"town": "Lumberton", "url": "https://ecode360.com/LU1362/documents/Agendas#category-311119646"},
-    {"town": "Burlington", "url": "https://twp.burlington.nj.us/content/159/82/default.aspx"},
+    {"town": "Burlington", "url": "https://twp.burlington.nj.us/planning-and-zoning"},
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Planning-Board-Meeting-Notices-Agendas-3/?"},
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Zoning-Board-of-Adjustment-Meeting-Notic-4/?"},
     {"town": "Delran", "url": "https://delrantownship.org/document-category/planning-board-agendas-minutes/"},
@@ -61,8 +61,7 @@ TARGET_SITES = [
     {"town": "Hammonton", "url": "https://www.townofhammonton.org/land-use-board/"},
     {"town": "Southampton", "url": "https://www.southamptonnj.org/government/meetings/land_development_board_.php"},
     {"town": "Eastampton", "url": "https://www.eastampton.com/meetings?boards-commissions=2031&combine=&department=All&field_smart_date_end_value=&field_smart_date_value_1="},
-    {"town": "Westampton", "url": "https://www.westamptonnj.gov/node/32/agenda"},
-    {"town": "Westampton", "url": "https://www.westamptonnj.gov/node/32/minutes"},
+    {"town": "Westampton", "url": "https://www.westamptonnj.gov/minutes-and-agendas"},
     {"town": "Shamong", "url": "https://www.shamong.net/community_county_burlington/meetingsagendasminutes/joint_land_use_board_jlub.php#outer-764sub-771"},
     {"town": "Tabernacle", "url": "https://www.tabernacle-nj.gov/departments/land_development_board/meeting_minutes.php"},
     {"town": "Swedesboro", "url": "https://ecode360.com/SW0669/documents/Minutes#category-89893453"},
@@ -135,6 +134,9 @@ UNRELATED_DOC_HINTS = (
 JS_RENDERED_DOMAINS = {
     "ecode360.com",
 }
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"}
+OFFICE_EXTENSIONS = {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
 
 # =========================
 # Residential-only filter
@@ -553,6 +555,55 @@ def is_downloadable_document_url(url: str) -> bool:
         return True
     return False
 
+
+def get_url_extension(url: str) -> str:
+    path = urlsplit(url).path.lower().strip()
+    if "." not in path:
+        return ""
+    return "." + path.rsplit(".", 1)[-1]
+
+
+def classify_candidate_type(url: str) -> str:
+    low = url.lower()
+    path = urlsplit(url).path.lower()
+    ext = get_url_extension(url)
+
+    if ext in IMAGE_EXTENSIONS:
+        return "skip_non_pdf_asset"
+    if ext in OFFICE_EXTENSIONS:
+        return "non_pdf_document"
+    if "drive.google.com/file/d/" in low and "/view" in low:
+        return "google_drive_viewer"
+    if path.endswith(".pdf") or "/documentcenter/view/" in low or "/agendacenter/viewfile/" in low:
+        return "pdf_candidate"
+    if is_obvious_intermediate_page_url(url):
+        return "intermediate_page"
+    if not is_downloadable_document_url(url):
+        return "non_document_page"
+    return "unknown_candidate"
+
+
+def convert_google_drive_viewer_to_download(url: str) -> Optional[str]:
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)/", url, flags=re.IGNORECASE)
+    if not m:
+        return None
+    file_id = m.group(1)
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+
+def looks_like_file_response(url: str, referer: str | None = None) -> bool:
+    try:
+        headers = {"Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8"}
+        if referer:
+            headers["Referer"] = referer
+        r = SESSION.get(url, timeout=45, allow_redirects=True, verify=False, headers=headers, stream=True)
+        r.raise_for_status()
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        cdisp = (r.headers.get("Content-Disposition") or "").lower()
+        return ("pdf" in ctype) or ("octet-stream" in ctype) or ("attachment" in cdisp)
+    except Exception:
+        return False
+
 def is_selector_filter_page(html: str, base_url: str) -> bool:
     low_url = base_url.lower()
     soup = make_soup(html)
@@ -796,11 +847,21 @@ def is_viewer_page(url: str) -> bool:
         return False
     if "/agendacenter/viewfile/" in low:
         return False
-
+    if "drive.google.com/file/d/" in low and "/view" in low:
+        return True
+        
     return (path.endswith(".php") or "agendaviewer.php" in low or "viewpublisher.php" in low)
 
 
 def resolve_viewer_to_pdfs(viewer_url: str) -> list[str]:
+    if "drive.google.com/file/d/" in viewer_url.lower() and "/view" in viewer_url.lower():
+        direct = convert_google_drive_viewer_to_download(viewer_url)
+        if not direct:
+            return []
+        if looks_like_file_response(direct, referer=viewer_url):
+            return [direct]
+        return []
+
     html = fetch_html(viewer_url)
     soup = make_soup(html)
 
@@ -975,8 +1036,8 @@ def filter_burlington_links(links: list[str]) -> list[str]:
             continue
         if any(k in low for k in ("agenda", "minutes", "planning-board", "zoning-board", "land-use-board")):
             keep.append(link)
-    return keep or links
-
+    return keep
+    
 def maybe_switch_eastampton_page(page_url: str, html: str) -> tuple[str, str]:
     low = page_url.lower()
     if "eastampton" not in low:
@@ -1258,6 +1319,13 @@ def main():
             html = fetch_html(page_url)
         except Exception as e:
             print(f"[ERROR] Fetch page failed: {town} {page_url} -> {e}")
+            err_low = str(e).lower()
+            if "404" in err_low:
+                town_reasons.add("source_404")
+            else:
+                town_reasons.add("wrong_target_url")
+            if town_reasons:
+                print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
             continue
 
         if town == "Eastampton":
@@ -1438,13 +1506,22 @@ def main():
             if link in seen or link in failed:
                 continue
 
-            if is_obvious_intermediate_page_url(link) and not is_pdf_source_url(link):
+            candidate_type = classify_candidate_type(link)
+            if candidate_type in {"skip_non_pdf_asset", "non_pdf_document"}:
+                town_reasons.add(candidate_type)
                 continue
-            if not is_downloadable_document_url(link) and not is_viewer_page(link):
+            if candidate_type in {"intermediate_page", "non_document_page"} and not is_viewer_page(link):
                 continue
             
             candidate_pdfs = [link]
-            if is_viewer_page(link):
+            if candidate_type == "google_drive_viewer":
+                transformed = convert_google_drive_viewer_to_download(link)
+                if transformed and looks_like_file_response(transformed, referer=page_url):
+                    candidate_pdfs = [transformed]
+                else:
+                    town_reasons.add("unsupported_google_drive_viewer")
+                    continue
+            elif is_viewer_page(link):
                 try:
                     resolved = resolve_viewer_to_pdfs(link)
                     if resolved:
@@ -1456,6 +1533,10 @@ def main():
                     continue
 
             for pdf_url in candidate_pdfs:
+                resolved_type = classify_candidate_type(pdf_url)
+                if resolved_type in {"skip_non_pdf_asset", "non_pdf_document"}:
+                    town_reasons.add(resolved_type)
+                    continue
                 if not is_downloadable_document_url(pdf_url):
                     continue
                 url_fingerprints = build_url_fingerprints(pdf_url)
