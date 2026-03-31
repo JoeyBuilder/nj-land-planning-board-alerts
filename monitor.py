@@ -341,6 +341,38 @@ def fetch_html(url: str) -> str:
 
     raise RuntimeError(str(last_err) if last_err else "Unknown fetch_html error")
 
+
+def detect_protected_source_reasons(html: str, page_url: str) -> set[str]:
+    low_html = (html or "").lower()
+    domain = urlsplit(page_url).netloc.lower().removeprefix("www.")
+    reasons: set[str] = set()
+
+    is_cloudflare_gate = any(
+        marker in low_html
+        for marker in (
+            "cloudflare",
+            "cf-chl",
+            "cf-browser-verification",
+            "verify you are human",
+            "checking your browser before accessing",
+            "attention required",
+            "just a moment",
+        )
+    )
+    if is_cloudflare_gate:
+        reasons.add("protected_source")
+        reasons.add("cloudflare_verification")
+
+    if domain == "ecode360.com" and (
+        "verify you are human" in low_html
+        or "cloudflare" in low_html
+        or "cf-chl" in low_html
+        or "challenge-platform" in low_html
+    ):
+        reasons.add("unsupported_protected_source")
+
+    return reasons
+
 def is_xml_like_document(text: str) -> bool:
     sample = (text or "").lstrip()[:400].lower()
     return (
@@ -1037,7 +1069,50 @@ def filter_burlington_links(links: list[str]) -> list[str]:
         if any(k in low for k in ("agenda", "minutes", "planning-board", "zoning-board", "land-use-board")):
             keep.append(link)
     return keep
-    
+
+
+
+def _extract_year_month_score(link: str) -> tuple[int, int]:
+    low = link.lower()
+    m = re.search(r"(20\d{2})[-_/](\d{1,2})", low)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m2 = re.search(r"(20\d{2})", low)
+    if m2:
+        return int(m2.group(1)), 0
+    return 0, 0
+
+
+def prioritize_recent_burlington_links(links: list[str], limit: int = 20) -> list[str]:
+    scored: list[tuple[tuple[int, int, int], str]] = []
+    for link in links:
+        low = link.lower()
+        year, month = _extract_year_month_score(link)
+        board_boost = 0
+        if any(k in low for k in ("planning-board", "planning_board", "planning board")):
+            board_boost += 2
+        if any(k in low for k in ("zoning-board", "zoning_board", "zoning board")):
+            board_boost += 2
+        if any(k in low for k in ("land-use-board", "land_use_board", "land use board")):
+            board_boost += 2
+        if "agenda" in low:
+            board_boost += 1
+        if "minutes" in low:
+            board_boost += 1
+        scored.append(((year, month, board_boost), link))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    out: list[str] = []
+    seen: set[str] = set()
+    for _, link in scored:
+        if link in seen:
+            continue
+        out.append(link)
+        seen.add(link)
+        if len(out) >= limit:
+            break
+    return out
+
 def maybe_switch_eastampton_page(page_url: str, html: str) -> tuple[str, str]:
     low = page_url.lower()
     if "eastampton" not in low:
@@ -1071,6 +1146,44 @@ def get_fallback_urls_for_town(town: str, page_url: str) -> list[str]:
     if town == "Eastampton" and "boards-commissions=2031" not in low:
         fallbacks.append(
             "https://www.eastampton.com/meetings?boards-commissions=2031&combine=&department=All&field_smart_date_end_value=&field_smart_date_value_1="
+        )
+
+    if town == "Hainesport":
+        fallbacks.extend(
+            [
+                "https://www.hainesporttownship.com/planning-board",
+                "https://www.hainesporttownship.com/zoning-board",
+            ]
+        )
+    if town == "Lumberton":
+        fallbacks.extend(
+            [
+                "https://ecode360.com/LU1362/documents/Planning_Agendas",
+                "https://ecode360.com/LU1362/documents/Zoning_Agendas",
+            ]
+        )
+    if town == "Cinnaminson":
+        fallbacks.extend(
+            [
+                "https://cinnaminsonnj.org/government/planning-board/",
+                "https://cinnaminsonnj.org/government/zoning-board/",
+            ]
+        )
+    if town == "Eastampton":
+        fallbacks.append("https://www.eastampton.com/government/planning-board")
+    if town == "Westampton":
+        fallbacks.extend(
+            [
+                "https://www.westamptonnj.gov/node/32/agenda",
+                "https://www.westamptonnj.gov/node/32/minutes",
+            ]
+        )
+    if town == "Swedesboro":
+        fallbacks.extend(
+            [
+                "https://ecode360.com/SW0669/documents/Planning_Agendas",
+                "https://ecode360.com/SW0669/documents/Zoning_Agendas",
+            ]
         )
 
     return list(dict.fromkeys(fallbacks))
@@ -1328,6 +1441,13 @@ def main():
                 print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
             continue
 
+        protected_reasons = detect_protected_source_reasons(html, page_url)
+        if protected_reasons:
+            town_reasons.update(protected_reasons)
+            print(f"[INFO] {town}: protected source detected, skipping link extraction for {page_url}")
+            print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
+            continue
+        
         if town == "Eastampton":
             page_url, html = maybe_switch_eastampton_page(page_url, html)
         if "drive.google.com/drive/folders/" in page_url.lower():
@@ -1430,12 +1550,17 @@ def main():
                         nav_links.extend(resolve_intermediate_links_to_pdfs(nav_intermediate, max_pages=10, max_depth=2))
                 pdf_links.extend(nav_links)
             pdf_links = filter_burlington_links(pdf_links)
+            pdf_links = prioritize_recent_burlington_links(pdf_links, limit=20)
         
         if not pdf_links:
             for fallback_url in get_fallback_urls_for_town(town, page_url):
                 try:
                     fallback_html = fetch_html(fallback_url)
                 except Exception:
+                    continue
+                fallback_protected = detect_protected_source_reasons(fallback_html, fallback_url)
+                if fallback_protected:
+                    town_reasons.update(fallback_protected)
                     continue
                 fallback_links = extract_pdf_links(fallback_html, fallback_url, relaxed=True)
                 fallback_links.extend(extract_script_document_links(fallback_html, fallback_url))
@@ -1484,7 +1609,9 @@ def main():
             if domain in JS_RENDERED_DOMAINS:
                 town_reasons.add("likely_js_rendered")
             if town == "Cinnaminson" and dbg["anchor_count"] == 0 and dbg["raw_href_count"] == 0:
-                town_reasons.add("wrong_target_url")   
+                town_reasons.add("wrong_target_url")
+            if town in {"Hainesport", "Lumberton", "Burlington", "Cinnaminson", "Eastampton", "Westampton", "Swedesboro"}:
+                town_reasons.add("town_specific_unresolved_source")
             print(
                 "[DEBUG] "
                 f"{town}: anchors={dbg['anchor_count']} raw_hrefs={dbg['raw_href_count']} "
