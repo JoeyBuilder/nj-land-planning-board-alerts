@@ -516,6 +516,43 @@ def is_pdf_source_url(url: str) -> bool:
         or "/agendacenter/viewfile/" in low
     )
 
+def is_obvious_intermediate_page_url(url: str) -> bool:
+    low = url.lower()
+    path = urlsplit(url).path.lower()
+
+    if path.endswith("/list.aspx") or path == "/list.aspx":
+        return True
+    if "/agendapublic" in low:
+        return True
+    if re.search(r"/20\d{2}-(?:agendas|minutes)-", path):
+        return True
+    if "novusagenda" in low and not any(k in low for k in ("/file/", "download", ".pdf")):
+        return True
+
+    htmlish_endings = (
+        ".aspx",
+        ".php",
+        ".html",
+        ".htm",
+    )
+    if path.endswith(htmlish_endings) and not is_pdf_source_url(url):
+        return True
+
+    return False
+
+def is_downloadable_document_url(url: str) -> bool:
+    low = url.lower()
+    path = urlsplit(url).path.lower()
+    if is_pdf_source_url(url):
+        return True
+    if any(k in path for k in ("/file/", "/download/", "/uploads/")):
+        return True
+    if ".pdf" in low:
+        return True
+    if any(k in low for k in ("download=", "file=", "filename=")):
+        return True
+    return False
+
 def is_selector_filter_page(html: str, base_url: str) -> bool:
     low_url = base_url.lower()
     soup = make_soup(html)
@@ -651,8 +688,9 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
 
         if table_or_grid_candidate and icon_based_anchor and "javascript:" not in low:
             if not (unrelated and not board_relevant):
-                links.append(full)
-                continue
+                if is_downloadable_document_url(full):
+                    links.append(full)
+                    continue
 
         if not effective_relaxed and not table_or_grid_candidate and not (looks_like_board_doc(a) or board_relevant):
             filtered_by_link_hints += 1
@@ -666,7 +704,7 @@ def extract_pdf_links(html: str, base_url: str, relaxed: bool = False) -> list[s
             links.append(full)
             continue
 
-        if path.endswith(".pdf"):
+        if is_downloadable_document_url(full):
             links.append(full)
 
     out: list[str] = []
@@ -846,7 +884,7 @@ def resolve_intermediate_links_to_pdfs(links: list[str], max_pages: int = 10, ma
                     if not candidate:
                         continue
                     full = normalize_url(requests.compat.urljoin(link, candidate))
-                    if is_pdf_source_url(full):
+                    if is_downloadable_document_url(full):
                         found.append(full)
 
             if depth < max_depth:
@@ -1277,6 +1315,8 @@ def main():
                     continue
                 embedded_found = extract_pdf_links(embedded_html, embedded_url, relaxed=True)
                 embedded_found.extend(extract_script_document_links(embedded_html, embedded_url))
+                if not embedded_found and is_obvious_intermediate_page_url(embedded_url):
+                    embedded_found.extend(resolve_intermediate_links_to_pdfs([embedded_url], max_pages=10, max_depth=2))
                 if not embedded_found:
                     embedded_child_pages = extract_board_child_pages(embedded_html, embedded_url)
                     for embedded_child_url in embedded_child_pages[:8]:
@@ -1398,6 +1438,11 @@ def main():
             if link in seen or link in failed:
                 continue
 
+            if is_obvious_intermediate_page_url(link) and not is_pdf_source_url(link):
+                continue
+            if not is_downloadable_document_url(link) and not is_viewer_page(link):
+                continue
+            
             candidate_pdfs = [link]
             if is_viewer_page(link):
                 try:
@@ -1411,6 +1456,8 @@ def main():
                     continue
 
             for pdf_url in candidate_pdfs:
+                if not is_downloadable_document_url(pdf_url):
+                    continue
                 url_fingerprints = build_url_fingerprints(pdf_url)
                 if pdf_url in seen or pdf_url in failed or any(fp in seen_docs for fp in url_fingerprints):
                     continue
