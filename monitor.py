@@ -1621,7 +1621,7 @@ def main():
             print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
             continue
 
-                pdf_links: list[str] = []
+        pdf_links: list[str] = []
         if town == "Hainesport":
             pdf_links.extend(extract_hainesport_specific_links(page_url, html))
         elif town == "Burlington":
