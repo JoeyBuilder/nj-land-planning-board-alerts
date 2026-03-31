@@ -40,30 +40,30 @@ TARGET_SITES = [
     {"town": "East Greenwich", "url": "https://www.eastgreenwichnj.com/government/planning-and-zoning"},
     {"town": "Mt. Laurel", "url": "https://www.mountlaurel.com/government/meetings/planning_board_meetings.php"},
     {"town": "Mt. Laurel", "url": "https://www.mountlaurel.com/government/meetings/zoning_board_meetings.php"},
-    {"town": "Medford", "url": "https://ecode360.com/ME0295/documents/Zoning_Agendas"},
-    {"town": "Medford", "url": "https://ecode360.com/ME0295/documents/Planning_Agendas"},
     {"town": "Medford Lakes", "url": "https://www.medfordlakes.com/AgendaCenter/Borough-Council-2"},
     {"town": "Evesham", "url": "https://evesham-nj.org/meetings/meeting-documents/planning-board-meetings/2026-planning-board-meeting-documents/2026-agendas-planning-board"},
     {"town": "Evesham", "url": "https://evesham-nj.org/meetings/meeting-documents/board-of-adjustment-meetings/2026-zoning-board-of-adjustment-meeting-documents/2026-agendas-zoning-board"},
     {"town": "Berlin Boro", "url": "https://www.berlinnj.org/planning-board/"},
-    {"town": "Hainesport", "url": "https://www.hainesporttownship.com/minutes-and-agendas"},
-    {"town": "Lumberton", "url": "https://ecode360.com/LU1362/documents/Agendas#category-311119646"},
-    {"town": "Burlington", "url": "https://twp.burlington.nj.us/planning-and-zoning"},
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Planning-Board-Meeting-Notices-Agendas-3/?"},
     {"town": "Moorestown", "url": "https://www.moorestown.nj.us/AgendaCenter/Zoning-Board-of-Adjustment-Meeting-Notic-4/?"},
     {"town": "Delran", "url": "https://delrantownship.org/document-category/planning-board-agendas-minutes/"},
     {"town": "Delran", "url": "https://delrantownship.org/zoning-board/"},
-    {"town": "Cinnaminson", "url": "https://cinnaminsonnj.org/agendas-resolutions-minutes/"},
     {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-agendas/"},
     {"town": "Elk Township", "url": "https://elktownshipnj.gov/boards/planning-and-zoning-board-minutes/"},
     {"town": "Woolwich", "url": "https://woolwichtwp.org/government/woolwich-township-minutes-agendas/"},
     {"town": "Glassboro", "url": "https://drive.google.com/drive/folders/1hDiaWBWSzM8mxb_rLPYdDWaatzgt9cI4?usp=drive_link"},
     {"town": "Hammonton", "url": "https://www.townofhammonton.org/land-use-board/"},
     {"town": "Southampton", "url": "https://www.southamptonnj.org/government/meetings/land_development_board_.php"},
-    {"town": "Eastampton", "url": "https://www.eastampton.com/meetings?boards-commissions=2031&combine=&department=All&field_smart_date_end_value=&field_smart_date_value_1="},
-    {"town": "Westampton", "url": "https://www.westamptonnj.gov/minutes-and-agendas"},
     {"town": "Shamong", "url": "https://www.shamong.net/community_county_burlington/meetingsagendasminutes/joint_land_use_board_jlub.php#outer-764sub-771"},
     {"town": "Tabernacle", "url": "https://www.tabernacle-nj.gov/departments/land_development_board/meeting_minutes.php"},
+    {"town": "Cinnaminson", "url": "https://cinnaminsonnj.org/agendas-resolutions-minutes/"},
+    {"town": "Eastampton", "url": "https://www.eastampton.com/meetings?boards-commissions=2031&combine=&department=All&field_smart_date_end_value=&field_smart_date_value_1="},
+    {"town": "Westampton", "url": "https://www.westamptonnj.gov/node/32/agenda"},
+    {"town": "Burlington", "url": "https://twp.burlington.nj.us/content/159/82/default.aspx"},
+    {"town": "Hainesport", "url": "https://www.hainesporttownship.com/node/20/agenda"},
+    {"town": "Lumberton", "url": "https://ecode360.com/LU1362/documents/Agendas#category-311119646"},
+    {"town": "Medford", "url": "https://ecode360.com/ME0295/documents/Zoning_Agendas"},
+    {"town": "Medford", "url": "https://ecode360.com/ME0295/documents/Planning_Agendas"},
     {"town": "Swedesboro", "url": "https://ecode360.com/SW0669/documents/Minutes#category-89893453"},
     {"town": "Swedesboro", "url": "https://ecode360.com/SW0669/documents/Agendas#category-89874773"},
 ]
@@ -1072,6 +1072,131 @@ def extract_iframe_and_embed_pages(html: str, base_url: str) -> list[str]:
                 pages.append(full)
     return list(dict.fromkeys(pages))
 
+def _extract_latest_year_link(soup: BeautifulSoup, base_url: str) -> str | None:
+    year_candidates: list[tuple[int, str]] = []
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        text = " ".join(a.stripped_strings).strip()
+        joined = f"{href} {text}"
+        year_match = re.search(r"(20\d{2})", joined)
+        if not year_match:
+            continue
+        year = int(year_match.group(1))
+        full = normalize_url(requests.compat.urljoin(base_url, href))
+        year_candidates.append((year, full))
+    if not year_candidates:
+        return None
+    year_candidates.sort(key=lambda item: item[0], reverse=True)
+    return year_candidates[0][1]
+
+
+def extract_hainesport_specific_links(page_url: str, html: str) -> list[str]:
+    soup = make_soup(html)
+    year_url = _extract_latest_year_link(soup, page_url)
+    print(f"[DEBUG] Hainesport: selected year page={year_url or 'none'}")
+    if not year_url:
+        return []
+
+    try:
+        year_html = fetch_html(year_url)
+    except Exception:
+        return []
+
+    year_soup = make_soup(year_html)
+    agenda_pages: list[str] = []
+    for a in year_soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        full = normalize_url(requests.compat.urljoin(year_url, href))
+        low = full.lower()
+        if is_pdf_source_url(full):
+            continue
+        if any(k in low for k in ("/agenda/agenda-", "/joint-land-use-board/agenda/", "/planning-board/agenda/", "/zoning-board/agenda/")):
+            agenda_pages.append(full)
+
+    agenda_pages = list(dict.fromkeys(agenda_pages))
+    selected_agenda = agenda_pages[0] if agenda_pages else None
+    print(f"[DEBUG] Hainesport: selected agenda page={selected_agenda or 'none'}")
+
+    final_pdfs: list[str] = []
+    for agenda_url in agenda_pages:
+        try:
+            agenda_html = fetch_html(agenda_url)
+        except Exception:
+            continue
+        agenda_soup = make_soup(agenda_html)
+        for a in agenda_soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            label = " ".join(a.stripped_strings).lower()
+            full = normalize_url(requests.compat.urljoin(agenda_url, href))
+            if not is_pdf_source_url(full):
+                continue
+            if "upload file" in label or full.lower().endswith(".pdf") or ".pdf?" in full.lower():
+                final_pdfs.append(full)
+    final_pdfs = list(dict.fromkeys(final_pdfs))
+    print(f"[DEBUG] Hainesport: final pdf count={len(final_pdfs)}")
+    return final_pdfs
+
+
+def extract_burlington_specific_links(page_url: str, html: str) -> list[str]:
+    soup = make_soup(html)
+    target_categories = ("planning board", "zoning board")
+    final_pdfs: list[str] = []
+
+    for category in target_categories:
+        category_url = None
+        for a in soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            text = " ".join(a.stripped_strings).lower()
+            if category in text or category.replace(" ", "-") in href.lower():
+                full = normalize_url(requests.compat.urljoin(page_url, href))
+                if not is_pdf_source_url(full):
+                    category_url = full
+                    break
+        print(f"[DEBUG] Burlington: selected category={category} url={category_url or 'none'}")
+        if not category_url:
+            continue
+
+        try:
+            category_html = fetch_html(category_url)
+        except Exception:
+            continue
+        category_soup = make_soup(category_html)
+
+        agendas_url = None
+        for a in category_soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            text = " ".join(a.stripped_strings).lower()
+            if "agenda" in text or "agenda" in href.lower():
+                full = normalize_url(requests.compat.urljoin(category_url, href))
+                if not is_pdf_source_url(full):
+                    agendas_url = full
+                    break
+        print(f"[DEBUG] Burlington: selected subcategory=agendas url={agendas_url or 'none'}")
+        if not agendas_url:
+            continue
+
+        try:
+            agendas_html = fetch_html(agendas_url)
+        except Exception:
+            continue
+        agendas_soup = make_soup(agendas_html)
+        year_url = _extract_latest_year_link(agendas_soup, agendas_url)
+        print(f"[DEBUG] Burlington: selected year={year_url or 'none'}")
+        if not year_url:
+            continue
+
+        try:
+            year_html = fetch_html(year_url)
+        except Exception:
+            continue
+
+        year_links = extract_pdf_links(year_html, year_url, relaxed=True)
+        year_links.extend(extract_script_document_links(year_html, year_url))
+        final_pdfs.extend(filter_burlington_links(year_links))
+
+    final_pdfs = list(dict.fromkeys(final_pdfs))
+    print(f"[DEBUG] Burlington: final pdf count={len(final_pdfs)}")
+    return final_pdfs
 
 def filter_burlington_links(links: list[str]) -> list[str]:
     keep: list[str] = []
@@ -1495,13 +1620,21 @@ def main():
             town_reasons.add("unsupported_source")
             print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
             continue
-        
+
+                pdf_links: list[str] = []
+        if town == "Hainesport":
+            pdf_links.extend(extract_hainesport_specific_links(page_url, html))
+        elif town == "Burlington":
+            pdf_links.extend(extract_burlington_specific_links(page_url, html))
+
+        used_town_specific = town in {"Hainesport", "Burlington"} and bool(pdf_links)
         relaxed_mode = is_selector_filter_page(html, page_url)
         if town in {"East Greenwich", "Burlington"}:
             # board-focused index pages with generic anchor labels
             relaxed_mode = True
-        pdf_links = extract_pdf_links(html, page_url, relaxed=relaxed_mode)
-        pdf_links.extend(extract_script_document_links(html, page_url))
+        if not pdf_links:
+            pdf_links = extract_pdf_links(html, page_url, relaxed=relaxed_mode)
+            pdf_links.extend(extract_script_document_links(html, page_url))
         
         intermediate_links: list[str] = []
         should_follow_intermediate = (
@@ -1509,7 +1642,7 @@ def main():
             or not pdf_links
             or "evesham-nj.org/meetings/meeting-documents" in page_url.lower()
         )
-        if should_follow_intermediate:
+        if should_follow_intermediate and not used_town_specific:
             intermediate_links = extract_intermediate_links(html, page_url, relaxed=relaxed_mode)
             if intermediate_links:
                 resolved_intermediate = resolve_intermediate_links_to_pdfs(intermediate_links)
@@ -1519,7 +1652,7 @@ def main():
                     town_reasons.add("intermediate_page_not_followed")
 
 
-        if town in {"Cherry Hill", "East Greenwich", "Burlington"}:
+        if town in {"Cherry Hill", "East Greenwich", "Burlington"} and not used_town_specific:
             child_pages = extract_board_child_pages(html, page_url)
             for child_url in child_pages[:8]:
                 try:
@@ -1534,7 +1667,7 @@ def main():
                         child_links.extend(resolve_intermediate_links_to_pdfs(child_intermediate, max_pages=10, max_depth=2))
                 pdf_links.extend(child_links)
 
-        if town == "East Greenwich":
+        if town == "East Greenwich" and not used_town_specific:
             pdf_links.extend(extract_embedded_document_links(html, page_url))
             embedded_pages = extract_iframe_and_embed_pages(html, page_url)
             for embedded_url in embedded_pages[:6]:
@@ -1576,7 +1709,7 @@ def main():
                         nav_links.extend(resolve_intermediate_links_to_pdfs(nav_intermediate, max_pages=10, max_depth=2))
                 pdf_links.extend(nav_links)
 
-        if town == "Burlington":
+        if town == "Burlington" and not pdf_links and not used_town_specific:
             script_nav_links = extract_script_navigation_links(html, page_url)
             for nav_url in script_nav_links[:10]:
                 try:
