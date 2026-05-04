@@ -1699,9 +1699,10 @@ def analyze_text(text: str) -> dict:
     }
 
 
-def create_github_issue(title: str, body: str) -> None:
+def create_github_issue(title: str, body: str) -> bool:
     if not (GITHUB_TOKEN and REPO):
-        raise RuntimeError("Missing GITHUB_TOKEN or GITHUB_REPOSITORY environment variables")
+        print("[WARN] Missing GITHUB_TOKEN or GITHUB_REPOSITORY; skipping GitHub issue creation.")
+        return False
 
     url = f"https://api.github.com/repos/{REPO}/issues"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
@@ -1709,6 +1710,7 @@ def create_github_issue(title: str, body: str) -> None:
 
     r = requests.post(url, headers=headers, json=payload, timeout=30)
     r.raise_for_status()
+    return True
 
 
 # =========================
@@ -2148,8 +2150,8 @@ def main():
     today = datetime.utcnow().strftime("%Y-%m-%d")
     title = f"Residential Subdivision Alert ({today}): {len(new_relevant_hits)} new document(s)"
 
-    create_github_issue(title=title, body=body)
-    print("[INFO] GitHub Issue created.")
+    if create_github_issue(title=title, body=body):
+        print("[INFO] GitHub Issue created.")
 
 
 if __name__ == "__main__":
