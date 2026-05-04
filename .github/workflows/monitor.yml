@@ -34,6 +34,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+          MONITOR_MAX_RUNTIME_SECONDS: "4200"
+          REQUEST_TIMEOUT_SECONDS: "20"
+          PDF_DOWNLOAD_TIMEOUT_SECONDS: "25"
+          MAX_PDFS_PER_TOWN: "8"
+          MAX_INTERMEDIATE_PAGES_PER_TOWN: "6"
         run: |
           set -euo pipefail
           echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Planning Board Monitor starting"
@@ -43,6 +48,7 @@ jobs:
           echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Planning Board Monitor finished (duration=$((end_epoch-start_epoch))s)"
 
       - name: Commit updated scraper state
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
