@@ -212,6 +212,8 @@ FAILED_FILE = DATA_DIR / "dead_links.json"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
 
+MAX_RUNTIME_SECONDS = int(os.getenv("MONITOR_MAX_RUNTIME_SECONDS", "4800"))
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
 
 # =========================
 # Helpers
@@ -287,6 +289,23 @@ def build_doc_fingerprint(text: str, pdf_path: pathlib.Path) -> str:
         return f"text:{sha1(normalized_text)}"
     return f"file:{hashlib.sha1(pdf_path.read_bytes()).hexdigest()}"
 
+def utc_now_iso() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def remaining_runtime_seconds(start_monotonic: float) -> float:
+    return MAX_RUNTIME_SECONDS - (time.monotonic() - start_monotonic)
+
+
+def should_stop_due_to_budget(start_monotonic: float, reserve_seconds: int = 120) -> bool:
+    return remaining_runtime_seconds(start_monotonic) <= reserve_seconds
+
+
+def persist_state(seen: set[str], seen_docs: set[str], failed: set[str]) -> None:
+    save_seen(seen)
+    save_seen_docs(seen_docs)
+    save_failed(failed)
+
 
 SESSION = requests.Session()
 SESSION.headers.update(
@@ -301,18 +320,30 @@ SESSION.headers.update(
     }
 )
 
+adapter = requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(
+    total=3,
+    read=3,
+    connect=3,
+    backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=frozenset(["GET", "HEAD"]),
+    raise_on_status=False,
+))
+SESSION.mount("http://", adapter)
+SESSION.mount("https://", adapter)
+
 
 def fetch_html(url: str) -> str:
     last_err: Optional[Exception] = None
 
     def via_jina(u: str) -> str:
-        r = SESSION.get(f"https://r.jina.ai/{u}", timeout=60, allow_redirects=True, verify=False)
+        r = SESSION.get(f"https://r.jina.ai/{u}", timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=True, verify=False)
         r.raise_for_status()
         return r.text
 
     for attempt in range(1, 4):
         try:
-            r = SESSION.get(url, timeout=40, allow_redirects=True, verify=False)
+            r = SESSION.get(url, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=True, verify=False)
             if r.status_code in (403, 406, 429):
                 return via_jina(url)
             r.raise_for_status()
@@ -323,7 +354,7 @@ def fetch_html(url: str) -> str:
             if parts.netloc.startswith("www."):
                 alt = urlunsplit((parts.scheme, parts.netloc[4:], parts.path, parts.query, parts.fragment))
                 try:
-                    r2 = SESSION.get(alt, timeout=40, allow_redirects=True, verify=False)
+                    r2 = SESSION.get(alt, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=True, verify=False)
                     if r2.status_code in (403, 406, 429):
                         return via_jina(alt)
                     r2.raise_for_status()
@@ -652,7 +683,7 @@ def looks_like_file_response(url: str, referer: str | None = None) -> bool:
         headers = {"Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8"}
         if referer:
             headers["Referer"] = referer
-        r = SESSION.get(url, timeout=45, allow_redirects=True, verify=False, headers=headers, stream=True)
+        r = SESSION.get(url, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=True, verify=False, headers=headers, stream=True)
         r.raise_for_status()
         ctype = (r.headers.get("Content-Type") or "").lower()
         cdisp = (r.headers.get("Content-Disposition") or "").lower()
@@ -1681,15 +1712,23 @@ def create_github_issue(title: str, body: str) -> None:
 # Main
 # =========================
 def main():
+    run_started = time.monotonic()
+    print(f"[INFO] [{utc_now_iso()}] monitor run starting; runtime budget={MAX_RUNTIME_SECONDS}s")
+
     seen = load_seen()
     seen_docs = load_seen_docs()
     failed = load_failed()
     new_relevant_hits = []
 
-    for site in TARGET_SITES:
+    for idx, site in enumerate(TARGET_SITES, start=1):
+        if should_stop_due_to_budget(run_started):
+            print(f"[WARN] [{utc_now_iso()}] runtime budget nearly exhausted; stopping before next town.")
+            break
+
         town = site["town"]
         page_url = site["url"]
         town_reasons: set[str] = set()
+        print(f"[INFO] [{utc_now_iso()}] starting town {idx}/{len(TARGET_SITES)}: {town} -> {page_url}")
         
         try:
             html = fetch_html(page_url)
@@ -2007,9 +2046,10 @@ def main():
         if town_reasons:
             print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
     
-    save_seen(seen)
-    save_seen_docs(seen_docs)
-    save_failed(failed)
+        print(f"[INFO] [{utc_now_iso()}] finished town {idx}/{len(TARGET_SITES)}: {town}")
+        persist_state(seen, seen_docs, failed)
+
+    persist_state(seen, seen_docs, failed)
 
     if not new_relevant_hits:
         print("[INFO] No new relevant subdivision docs.")
