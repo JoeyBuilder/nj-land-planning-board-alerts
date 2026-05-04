@@ -1723,7 +1723,7 @@ def main():
     failed = load_failed()
     new_relevant_hits = []
 
-        stats = {
+    stats = {
         "towns_started": 0,
         "towns_completed": 0,
         "towns_skipped_budget": 0,
