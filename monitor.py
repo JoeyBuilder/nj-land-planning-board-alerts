@@ -214,6 +214,9 @@ REPO = os.getenv("GITHUB_REPOSITORY")
 
 MAX_RUNTIME_SECONDS = int(os.getenv("MONITOR_MAX_RUNTIME_SECONDS", "4800"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
+PDF_DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("PDF_DOWNLOAD_TIMEOUT_SECONDS", "25"))
+MAX_PDFS_PER_TOWN = int(os.getenv("MAX_PDFS_PER_TOWN", "8"))
+MAX_INTERMEDIATE_PAGES_PER_TOWN = int(os.getenv("MAX_INTERMEDIATE_PAGES_PER_TOWN", "6"))
 
 # =========================
 # Helpers
@@ -1540,7 +1543,7 @@ def download_pdf(url: str, referer: str | None = None) -> pathlib.Path:
 
                 r = SESSION.get(
                     cand,
-                    timeout=90,
+                    timeout=PDF_DOWNLOAD_TIMEOUT_SECONDS,
                     allow_redirects=True,
                     verify=False,
                     headers=headers,
@@ -1720,13 +1723,29 @@ def main():
     failed = load_failed()
     new_relevant_hits = []
 
+        stats = {
+        "towns_started": 0,
+        "towns_completed": 0,
+        "towns_skipped_budget": 0,
+        "pdfs_found": 0,
+        "pdfs_attempted": 0,
+        "pdfs_download_failed": 0,
+        "pdfs_relevant": 0,
+    }
+
+    budget_stop_requested = False
+
     for idx, site in enumerate(TARGET_SITES, start=1):
-        if should_stop_due_to_budget(run_started):
+        if should_stop_due_to_budget(run_started, reserve_seconds=300):
             print(f"[WARN] [{utc_now_iso()}] runtime budget nearly exhausted; stopping before next town.")
+            stats["towns_skipped_budget"] += 1
+            budget_stop_requested = True
             break
 
         town = site["town"]
         page_url = site["url"]
+        town_started = time.monotonic()
+        stats["towns_started"] += 1
         town_reasons: set[str] = set()
         print(f"[INFO] [{utc_now_iso()}] starting town {idx}/{len(TARGET_SITES)}: {town} -> {page_url}")
         
@@ -1741,6 +1760,7 @@ def main():
                 town_reasons.add("wrong_target_url")
             if town_reasons:
                 print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
+            failed.add(f"{town}|{page_url}|parse_error")
             continue
 
         protected_reasons, protected_markers, strongly_protected = detect_protected_source_reasons(html, page_url)
@@ -1758,6 +1778,7 @@ def main():
                 f"protected_source_markers={protected_markers}"
             )
             print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
+            failed.add(f"{town}|{page_url}|protected_source")
             continue
         if protected_reasons and strongly_protected:
             print(
@@ -1771,6 +1792,7 @@ def main():
             page_url, html = maybe_switch_eastampton_page(page_url, html)
         if "drive.google.com/drive/folders/" in page_url.lower():
             town_reasons.add("unsupported_source")
+            failed.add(f"{town}|{page_url}|no_links")
             print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
             continue
 
@@ -1798,7 +1820,15 @@ def main():
         if should_follow_intermediate and not used_town_specific:
             intermediate_links = extract_intermediate_links(html, page_url, relaxed=relaxed_mode)
             if intermediate_links:
-                resolved_intermediate = resolve_intermediate_links_to_pdfs(intermediate_links)
+                if should_stop_due_to_budget(run_started, reserve_seconds=300):
+                    town_reasons.add("runtime_budget")
+                    stats["towns_skipped_budget"] += 1
+                    budget_stop_requested = True
+                    failed.add(f"{town}|{page_url}|runtime_budget")
+                    break
+                resolved_intermediate = resolve_intermediate_links_to_pdfs(
+                    intermediate_links, max_pages=MAX_INTERMEDIATE_PAGES_PER_TOWN
+                )
                 if resolved_intermediate:
                     pdf_links.extend(resolved_intermediate)
                 elif not pdf_links:
@@ -1817,7 +1847,7 @@ def main():
                 if not child_links:
                     child_intermediate = extract_intermediate_links(child_html, child_url, relaxed=True)
                     if child_intermediate:
-                        child_links.extend(resolve_intermediate_links_to_pdfs(child_intermediate, max_pages=10, max_depth=2))
+                        child_links.extend(resolve_intermediate_links_to_pdfs(child_intermediate, max_pages=MAX_INTERMEDIATE_PAGES_PER_TOWN, max_depth=2))
                 pdf_links.extend(child_links)
 
         if town == "East Greenwich" and not used_town_specific:
@@ -1831,7 +1861,7 @@ def main():
                 embedded_found = extract_pdf_links(embedded_html, embedded_url, relaxed=True)
                 embedded_found.extend(extract_script_document_links(embedded_html, embedded_url))
                 if not embedded_found and is_obvious_intermediate_page_url(embedded_url):
-                    embedded_found.extend(resolve_intermediate_links_to_pdfs([embedded_url], max_pages=10, max_depth=2))
+                    embedded_found.extend(resolve_intermediate_links_to_pdfs([embedded_url], max_pages=MAX_INTERMEDIATE_PAGES_PER_TOWN, max_depth=2))
                 if not embedded_found:
                     embedded_child_pages = extract_board_child_pages(embedded_html, embedded_url)
                     for embedded_child_url in embedded_child_pages[:8]:
@@ -1859,8 +1889,8 @@ def main():
                 if not nav_links:
                     nav_intermediate = extract_intermediate_links(nav_html, nav_url, relaxed=True)
                     if nav_intermediate:
-                        nav_links.extend(resolve_intermediate_links_to_pdfs(nav_intermediate, max_pages=10, max_depth=2))
-                pdf_links.extend(nav_links)
+                        nav_links.extend(resolve_intermediate_links_to_pdfs(nav_intermediate, max_pages=MAX_INTERMEDIATE_PAGES_PER_TOWN, max_depth=2))
+                    pdf_links.extend(nav_links)
 
         if town == "Burlington" and not pdf_links and not used_town_specific:
             script_nav_links = extract_script_navigation_links(html, page_url)
@@ -1874,7 +1904,7 @@ def main():
                 if not nav_links:
                     nav_intermediate = extract_intermediate_links(nav_html, nav_url, relaxed=True)
                     if nav_intermediate:
-                        nav_links.extend(resolve_intermediate_links_to_pdfs(nav_intermediate, max_pages=10, max_depth=2))
+                        nav_links.extend(resolve_intermediate_links_to_pdfs(nav_intermediate, max_pages=MAX_INTERMEDIATE_PAGES_PER_TOWN, max_depth=2))
                 pdf_links.extend(nav_links)
             pdf_links = filter_burlington_links(pdf_links)
             pdf_links = prioritize_recent_burlington_links(pdf_links, limit=20)
@@ -1907,7 +1937,7 @@ def main():
                 if not fallback_links:
                     fallback_intermediate = extract_intermediate_links(fallback_html, fallback_url, relaxed=True)
                     if fallback_intermediate:
-                        fallback_links.extend(resolve_intermediate_links_to_pdfs(fallback_intermediate, max_pages=10, max_depth=2))
+                        fallback_links.extend(resolve_intermediate_links_to_pdfs(fallback_intermediate, max_pages=MAX_INTERMEDIATE_PAGES_PER_TOWN, max_depth=2))
                 if fallback_links:
                     page_url = fallback_url
                     html = fallback_html
@@ -1937,7 +1967,8 @@ def main():
             if embedded_links:
                 pdf_links.extend(embedded_links)
         
-        pdf_links = list(dict.fromkeys(pdf_links))[:20]
+        pdf_links = list(dict.fromkeys(pdf_links))[:MAX_PDFS_PER_TOWN]
+        stats["pdfs_found"] += len(pdf_links)
         print(f"[INFO] {town}: found {len(pdf_links)} pdf link(s)")
 
         if not pdf_links:
@@ -1968,8 +1999,15 @@ def main():
                 f"[DEBUG] {town}: filtered_by_LINK_HINTS={dbg['filtered_by_link_hints_count']} "
                 f"examples={dbg['filtered_by_link_hints_examples']}"
             )
-        
+            failed.add(f"{town}|{page_url}|no_links")
+            
         for link in pdf_links:
+            if should_stop_due_to_budget(run_started, reserve_seconds=300):
+                town_reasons.add("runtime_budget")
+                stats["towns_skipped_budget"] += 1
+                budget_stop_requested = True
+                failed.add(f"{town}|{page_url}|runtime_budget")
+                break
             if link in seen or link in failed:
                 continue
 
@@ -2011,6 +2049,14 @@ def main():
                     continue
 
                 try:
+                    if should_stop_due_to_budget(run_started, reserve_seconds=300):
+                        town_reasons.add("runtime_budget")
+                        stats["towns_skipped_budget"] += 1
+                        budget_stop_requested = True
+                        failed.add(f"{town}|{pdf_url}|runtime_budget")
+                        break
+                    print(f"[INFO] {town}: processing pdf {pdf_url}")
+                    stats["pdfs_attempted"] += 1
                     pdf_path = download_pdf(pdf_url, referer=page_url)
                     text = extract_text(pdf_path)
                     result = analyze_text(text)
@@ -2023,6 +2069,7 @@ def main():
                     seen_docs.add(doc_fingerprint)
 
                     if result["relevant"]:
+                        stats["pdfs_relevant"] += 1
                         new_relevant_hits.append(
                             {
                                 "town": town,
@@ -2041,16 +2088,34 @@ def main():
                     if "all download candidates returned 404" in msg or msg.startswith("404 not found"):
                         failed.add(pdf_url)
                         town_reasons.add("download_404")
+                        stats["pdfs_download_failed"] += 1
+                    elif "timeout" in msg:
+                        failed.add(f"{town}|{pdf_url}|download_timeout")
+                        stats["pdfs_download_failed"] += 1
+                    else:
+                        failed.add(f"{town}|{pdf_url}|parse_error")
                     print(f"[ERROR] PDF process failed: {town} {pdf_url} -> {e}")
                     
         if town_reasons:
             print(f"[SUMMARY] {town}: reasons={sorted(town_reasons)}")
     
-        print(f"[INFO] [{utc_now_iso()}] finished town {idx}/{len(TARGET_SITES)}: {town}")
+        elapsed = time.monotonic() - town_started
+        print(f"[INFO] [{utc_now_iso()}] finished town {idx}/{len(TARGET_SITES)}: {town} elapsed={elapsed:.1f}s")
+        stats["towns_completed"] += 1
         persist_state(seen, seen_docs, failed)
+        if budget_stop_requested:
+            break
 
-    persist_state(seen, seen_docs, failed)
-
+    runtime_seconds = int(time.monotonic() - run_started)
+    print(f"[INFO] totals towns_started={stats['towns_started']}")
+    print(f"[INFO] totals towns_completed={stats['towns_completed']}")
+    print(f"[INFO] totals towns_skipped_budget={stats['towns_skipped_budget']}")
+    print(f"[INFO] totals pdfs_found={stats['pdfs_found']}")
+    print(f"[INFO] totals pdfs_attempted={stats['pdfs_attempted']}")
+    print(f"[INFO] totals pdfs_download_failed={stats['pdfs_download_failed']}")
+    print(f"[INFO] totals pdfs_relevant={stats['pdfs_relevant']}")
+    print(f"[INFO] totals runtime_seconds={runtime_seconds}")
+    
     if not new_relevant_hits:
         print("[INFO] No new relevant subdivision docs.")
         return
@@ -2088,4 +2153,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    budget_exit = False
+    try:
+        try:
+            main()
+        finally:
+            persist_state(load_seen(), load_seen_docs(), load_failed())
+    except (KeyboardInterrupt, SystemExit) as e:
+        msg = str(e).lower()
+        budget_exit = ("runtime budget" in msg or "budget" in msg)
+        persist_state(load_seen(), load_seen_docs(), load_failed())
+        print(f"[WARN] monitor interrupted: {e}")
+        if budget_exit:
+            raise SystemExit(0)
+        raise
